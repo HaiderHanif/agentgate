@@ -14,10 +14,11 @@ verify a refactor without re-recording - or re-record the trace.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from agentgate.exceptions import ReplayError
+from agentgate.redaction import DEFAULT_REDACT_KEYS, redact_value
 from agentgate.trace import ModelCall, ToolCall, Trace, digest
 
 __all__ = ["ReplayContext", "ReplayError", "replay_run"]
@@ -36,6 +37,7 @@ class ReplayContext:
         *,
         strict: bool = True,
         extra_tools: Mapping[str, Any] | None = None,
+        redact_keys: Sequence[str] | None = None,
     ) -> None:
         self._golden = golden
         self._strict = strict
@@ -45,6 +47,9 @@ class ReplayContext:
         }
         self._by_name: dict[str, Any] = {t.name: t.result for t in golden.tool_calls}
         self._extra: dict[str, Any] = dict(extra_tools or {})
+        self._redact_keys: list[str] = [
+            k.lower() for k in (redact_keys if redact_keys is not None else DEFAULT_REDACT_KEYS)
+        ]
         self.observed = Trace(
             name=golden.name,
             agent=golden.agent,
@@ -78,23 +83,41 @@ class ReplayContext:
         )
         return recorded.response_text
 
+    def _lookup(self, name: str, arguments: dict[str, Any]) -> tuple[bool, Any]:
+        """Resolve a recorded result, or report that there is none.
+
+        Resolution order: the exact recorded call; the same call with sensitive
+        arguments masked; an explicit `extra_tools` stub; then, in non-strict
+        mode, any recorded call to the same tool.
+
+        The masked attempt is not a convenience. Traces are redacted before they
+        are committed, so a golden trace holds `<redacted>` where the live agent
+        passes a real API key. Without this step, redacting an argument would
+        quietly make that scenario impossible to replay - privacy and
+        testability would be in direct conflict, and privacy would lose.
+        """
+        key = (name, digest(arguments))
+        if key in self._exact:
+            return True, self._exact[key]
+
+        masked_key = (name, digest(redact_value(arguments, self._redact_keys)))
+        if masked_key in self._exact:
+            return True, self._exact[masked_key]
+
+        if name in self._extra:
+            return True, self._extra[name]
+        if not self._strict and name in self._by_name:
+            return True, self._by_name[name]
+        return False, None
+
     def tool(self, name: str, **arguments: Any) -> Any:
         """Serve the recorded result for this tool call.
-
-        Resolution order: the exact recorded call, then an explicit `extra_tools`
-        stub, then - in non-strict mode - any recorded call to the same tool.
 
         A miss is not an error condition to work around, it *is* the finding.
         The agent asked for something it never asked for when the trace was good.
         """
-        key = (name, digest(arguments))
-        if key in self._exact:
-            result = self._exact[key]
-        elif name in self._extra:
-            result = self._extra[name]
-        elif not self._strict and name in self._by_name:
-            result = self._by_name[name]
-        else:
+        found, result = self._lookup(name, arguments)
+        if not found:
             raise ReplayError(
                 f"no recorded result for tool {name!r} with arguments {arguments!r}. "
                 f"Recorded path was {self._golden.tool_sequence}. "
@@ -118,13 +141,18 @@ def replay_run(
     *,
     strict: bool = True,
     extra_tools: Mapping[str, Any] | None = None,
+    redact_keys: Sequence[str] | None = None,
 ) -> Trace:
     """Replay `agent` against `golden` and return the observed trace.
 
     :param strict: match recorded tool calls on arguments as well as name.
     :param extra_tools: stub results for tools absent from the golden trace,
         so an intentionally added step can be verified without re-recording.
+    :param redact_keys: argument keys that were masked when the trace was
+        saved. Defaults to the same list the recorder uses.
     """
-    context = ReplayContext(golden, strict=strict, extra_tools=extra_tools)
+    context = ReplayContext(
+        golden, strict=strict, extra_tools=extra_tools, redact_keys=redact_keys
+    )
     output = agent(context)
     return context.finish(output)
