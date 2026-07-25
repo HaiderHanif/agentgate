@@ -1,179 +1,148 @@
 # Limitations and security considerations
 
-This page exists because a testing tool that overstates its coverage is worse
-than no testing tool. A green agentgate check means one specific thing, and it is
-narrower than "the agent is correct".
+The most dangerous failure mode for a testing tool is not a false alarm. It is a
+green check over a path that was never tested. Teams calibrate their trust to
+what a tool claims, so an overstated claim is a safety problem rather than a
+marketing one.
 
-## What a passing run actually proves
+Everything below is a known gap in agentgate 0.2.x.
 
-> Against **this recorded scenario**, with **these recorded tool results**, the
-> agent took the same decisions it took when a human approved that recording,
-> and satisfied the constraints you declared.
+---
 
-That is genuinely valuable and it is not a correctness proof.
+## 1. The oracle problem: agentgate does not know what "correct" means
 
-## What it does not prove
+A golden trace records one run that a human looked at once and accepted. That is
+evidence of a plausible path, not proof of a correct one. If the recorded run was
+subtly wrong, every future run is measured against that mistake and the suite
+will faithfully defend the bug.
 
-### The golden trace might not be correct
+- **Comparative checks** (`tool_sequence`, `tool_arguments`, `output_similarity`)
+  inherit the golden run's judgement completely.
+- **Absolute constraints** (`Ordering`, `ArgumentConstraint`, `OutputPolicy`,
+  `required_tools`, `forbidden_tools`, cost and latency budgets) do not. They
+  state a requirement that holds regardless of any recording.
 
-A recording captures what happened, not what should have happened. If the
-original run got lucky, took a shortcut, or was reviewed carelessly, agentgate
-will defend that behaviour forever with complete confidence.
+Use absolute constraints for anything that actually matters. If the only thing
+standing between you and a $10,000 refund is that the golden trace happened to
+say $49.99, you have a diff, not a gate.
 
-**This is the oracle problem, and the tool does not solve it.** A trace is only
-as good as the human who approved it.
+## 2. Output comparison is lexical, not semantic
 
-Mitigate it by treating trace files as reviewed artifacts: put them behind
-CODEOWNERS, require a second approver, and state absolute invariants as
-`required_tools`, `Ordering`, and `ArgumentConstraint` rules rather than relying
-on the recording alone. Constraints are independent of what the golden run did,
-which is exactly why they are worth writing.
+`check_output_similarity` uses `difflib.SequenceMatcher`. It catches a wholly
+different answer and ignores punctuation drift. It does not understand meaning:
 
-### Replay does not test the model
+| Golden | Observed | Score | Reality |
+|---|---|---|---|
+| `Refund complete.` | `Refund initiated.` | very high | materially different |
+| `You will receive it today.` | `You may receive it soon.` | high | materially different |
+| `Your account is closed.` | `Account closure requested.` | moderate | materially different |
 
-Model responses are served from the recording. If you change a prompt, replay
-tells you whether your **orchestration** still behaves correctly given the old
-response. It cannot tell you whether the new prompt makes the model reason worse.
+agentgate passes all three. There is no LLM judge and no embedding model in the
+library, deliberately: a non-deterministic grader inside a determinism tool is a
+contradiction, and it would make the gate itself flaky.
 
-That requires a live eval. agentgate is not one, and does not replace one.
-
-Use replay for orchestration regressions on every commit, and live evals on a
-slower cadence for reasoning quality. They answer different questions.
-
-### Replay does not test failure handling
-
-Recorded tool results are the results you recorded - usually successful ones.
-Replay will not surface a timeout, a 500, malformed JSON, an expired token, or a
-rate limit unless you deliberately recorded a run containing one.
-
-Record failure scenarios explicitly. A trace where `issue_refund` raises is a
-valid, useful golden trace.
-
-### Replay does not capture hidden state
-
-agentgate records the tool boundary, not the world behind it. If a tool returned
-`{"eligible": true}` because the test account was premium, replay reproduces that
-answer regardless of whether the same is true in production.
-
-This is a real gap. Replay verifies the agent's logic given an environment; it
-cannot verify that the environment still behaves that way. Contract tests on your
-tools cover the other half.
-
-### Determinism is only as good as the environment
-
-`deterministic()` freezes `time`, `random`, and `uuid`. It does not freeze:
-
-- functions captured before the block (`from time import time`)
-- C extensions with their own clocks
-- concurrency and thread scheduling
-- environment variables and locale
-- network access your tools perform outside the recorded boundary
-
-Run replay in a container with no network for the strongest guarantee.
-
-### Comparison is lexical, not semantic
-
-`output_similarity` is a character-ratio measure. It reliably catches a wholly
-different answer and reliably ignores punctuation drift. It **cannot** tell that
-"refund complete" and "refund initiated" mean different things - they are one
-word apart and score as nearly identical.
-
-If a distinction is meaning-critical, encode it explicitly:
+Express meaning-sensitive wording as explicit rules instead:
 
 ```python
 OutputPolicy(
-    must_contain=["has been requested"],
-    must_not_contain=["is complete", "has been closed"],
+    must_contain=["reference number"],
+    must_not_contain=["guaranteed", "goodwill bonus"],
 )
 ```
 
-Do not rely on similarity scoring for compliance wording. It is a smoke alarm,
-not a fire inspection.
+## 3. Coverage: only the paths you recorded are tested
 
-### Coverage is exactly what you recorded
+A passing suite means "the scenarios in `traces/` did not regress". It says
+nothing about the scenarios you never recorded, which is where incidents live.
+There is no scenario generation, no fuzzing, and no coverage measure over the
+agent's decision space. Three golden traces are three data points, not a safety
+argument.
 
-agentgate tests the scenarios in your trace directory. Nothing else. Unseen
-inputs, adversarial prompts, multi-intent requests, unicode edge cases, and
-long-session drift are all invisible to it unless recorded.
+## 4. Replay is not production
 
-**agentgate is necessary but not sufficient.** Pair it with adversarial evals,
-fuzzing, production sampling, and human review.
+Replay serves recorded results. It therefore cannot observe:
 
-### Single-turn only, for now
+- tool timeouts, 5xx responses, rate limits, partial or malformed payloads
+- auth expiry, permission changes, schema drift in a tool's response shape
+- real latency (replayed steps record `latency_ms = 0.0`, so `max_latency_ms`
+  is inert during replay and meaningful only on recorded runs)
+- anything depending on hidden state: database rows, feature flags, caches,
+  inventory, account status, cross-session memory
 
-The trace model represents one agent run. Multi-turn manipulation - trust built
-over turn one, an exception requested in turn two, a policy violation in turn
-three - is not currently expressible. Multi-turn traces are on the roadmap.
+Replay answers "given these exact inputs, did the decision path change?". It
+does not answer "does this agent work".
 
-### No parallel tool calls
+## 5. Determinism has edges
 
-Concurrent calls have no deterministic order, so there is nothing stable to
-assert against. Agents issuing parallel tool calls are unsupported rather than
-silently mis-verified.
+`deterministic()` patches module attributes. Code that captured a reference
+before entry keeps the real one:
 
-## Security considerations
+```python
+from datetime import datetime   # captured at import time - NOT frozen
+import datetime                 # datetime.datetime.now() - frozen
+```
 
-### Traces are sensitive artifacts
+Also note:
 
-A golden trace contains real tool arguments and real tool results from the
-recorded run. That can include customer names, emails, internal IDs, and
-financial records.
+- Wall clocks (`time.time`, `datetime.now`) are **frozen**. Elapsed clocks
+  (`time.monotonic`, `perf_counter`) **advance** by a fixed step, because
+  freezing them makes `while monotonic() - start < timeout` loop forever. Both
+  are reproducible run to run.
+- Naive `datetime.now()` returns the frozen instant with the timezone dropped,
+  not converted to local time. Converting would reintroduce the machine's
+  timezone as a source of divergence.
+- Concurrency is not controlled. `Recorder` is **not thread-safe**, and parallel
+  tool calls are not currently modelled - step order under concurrency is not
+  guaranteed reproducible.
 
-agentgate redacts a default key list on write, and prompts are stored only as
-digests. **Redaction is key-name based and is not a guarantee.** It will not
-catch a card number embedded in a free-text field.
+## 6. Redaction is best-effort
 
-Before committing your first trace:
+`redact_trace` masks by key and by value pattern, but:
 
-1. Open the JSON and read it.
-2. Extend `redact_keys` for your domain.
-3. Record against synthetic data where you can.
-4. Never commit a trace recorded against production customer data.
+- Email addresses and phone numbers are **not masked by default**. They are
+  frequently load-bearing in a trace, and masking them silently would break more
+  runs than it protects. Use `OutputPolicy(forbid_pii=[...])` to *detect* them.
+- The `credit_card` pattern has **no Luhn check** and `phone` matches bare digit
+  runs, so both over-match. `api_key` matches common prefixes only.
+- `Trace.metadata` is free-form and is **not redacted**. Do not put secrets there.
+- Tool *arguments* are masked by key only. Value-pattern rewriting of arguments
+  would change what the agent is recorded as having asked for.
 
-### Traces are a security control, so protect them
+**Never record traces against production data.** Redaction reduces the blast
+radius of a mistake; it is not a compliance control.
 
-An attacker who edits a golden trace redefines "correct" and turns the CI check
-into cover. Defences, in order of importance:
+## 7. Trace integrity depends on how you wire CI
 
-1. **CODEOWNERS on the trace directory** - trace changes need a named reviewer.
-2. **Signing** - `agentgate sign` adds an HMAC over the behavioural content;
-   `verify_trace` detects any post-signing edit.
-3. **Required status checks on a protected branch** - so the gate cannot be
-   skipped by editing a workflow in the same pull request.
-4. **Review trace diffs like code.** A trace diff *is* a behaviour change.
+A golden trace is an executable expectation living in the repository, so anyone
+who can edit it can weaken the gate. `agentgate sign` and
+`agentgate scan --require-signature` exist for this, but they only bind if:
 
-### Replay is not a sandbox
+- `AGENTGATE_SIGNING_KEY` is a CI secret, not a committed value
+- the verify job is a **required** status check on a protected branch
+- `.github/` and `traces/` are covered by CODEOWNERS review
 
-Replay does not call your real tools, but it **does execute your agent code** in
-the current process. If the agent shells out, writes files, or imports something
-hostile, replay will do that too.
+A gate that a pull request can switch off is not a gate. agentgate cannot
+enforce any of this for you - it is repository configuration.
 
-Run untrusted agent code in a container. The published Docker image exists for
-this. Do not treat "it's only a test" as isolation.
+## 8. Recorded tool output is untrusted input
 
-### Recorded tool output can carry prompt injections
+A recorded tool result can contain prompt-injection text, and replay feeds it
+back to the agent verbatim. `Policy(detect_injection=True)` scans for known
+patterns and reports findings, but pattern matching is not a defence - it is a
+signal. Treat any trace from an external source as hostile until reviewed.
 
-Tool results from web searches, tickets, or scraped pages may contain injection
-payloads. Once recorded, they are replayed into the agent on every run - and if
-the agent complied when the trace was made, that compliance is now the approved
-baseline.
+agentgate does **not** sandbox replay. Your agent code runs with the privileges
+of the process that invoked it.
 
-Enable `Policy(detect_injection=True)`. It reports as a warning by default,
-because pattern matching cannot judge intent and a scanner that fails builds on
-false positives gets switched off within a week.
+## 9. Not yet supported
 
-### Retention
+Multi-turn conversations, parallel tool calls, streaming responses, async
+agents, multiple acceptable traces for one scenario, fault injection during
+replay, a trace viewer UI, and retention/deletion tooling. Framework adapters
+exist for OpenAI and Anthropic message shapes only; LangChain, LlamaIndex,
+CrewAI, AutoGen and the Vercel AI SDK are not covered.
 
-agentgate stores traces as files in your repository. It has no retention or
-deletion policy, because it has no storage layer to apply one to. If you operate
-under GDPR, HIPAA, or PCI-DSS, treat the trace directory as regulated data and
-apply your own controls.
+---
 
-## How to use this tool responsibly
-
-- Treat a passing gate as "no known regression", not "safe to ship".
-- Write absolute constraints, not just comparisons against a recording.
-- Add an `OutputPolicy` for anything with legal or financial consequences.
-- Record failure paths, not only happy paths.
-- Review trace diffs as carefully as code diffs.
-- Run it alongside evals, not instead of them.
+If you hit a failure mode that is not listed here, that is a documentation bug
+as much as a code one. Please open an issue.

@@ -1,12 +1,24 @@
-# Golden traces define what "correct behaviour" means. Editing one silently
-# redefines the specification, which makes them a security-relevant artifact
-# rather than test data. Every change needs an explicit review.
+# Review is required on the files where a subtle change can disable a check
+# without failing a single test. A green suite is not evidence that the gates
+# still work - that is precisely the failure mode this project argues against.
 
-/examples/**/traces/    @HaiderHanif
-/traces/                @HaiderHanif
+* @HaiderHanif
 
-# The gate itself, and anything that could weaken it.
-/.github/workflows/     @HaiderHanif
-/action.yml             @HaiderHanif
-/src/agentgate/integrity.py   @HaiderHanif
-/src/agentgate/redaction.py   @HaiderHanif
+# Golden traces are executable expectations. Editing one silently changes what
+# "correct" means for every future run.
+/examples/**/traces/ @HaiderHanif
+
+# CI configuration decides whether any gate is enforced at all.
+/.github/ @HaiderHanif
+
+# Integrity, redaction and injection scanning are the security surface.
+/src/agentgate/integrity.py @HaiderHanif
+/src/agentgate/redaction.py @HaiderHanif
+/src/agentgate/injection.py @HaiderHanif
+
+# The checks themselves, and the determinism harness they rely on.
+/src/agentgate/assertions.py @HaiderHanif
+/src/agentgate/constraints.py @HaiderHanif
+/src/agentgate/determinism.py @HaiderHanif
+
+/SECURITY.md @HaiderHanif
