@@ -128,12 +128,13 @@ class ReplayContext:
         wanted = digest(arguments)
         masked = digest(redact_value(arguments, self._redact_keys))
 
-        for candidates in (
+        strategies = (
             lambda call: call.name == name and digest(call.arguments) in (wanted, masked),
             lambda call: (not self._strict) and call.name == name,
-        ):
+        )
+        for matches in strategies:
             for position, call in enumerate(self._remaining):
-                if call is not None and candidates(call):
+                if call is not None and matches(call):
                     self._remaining[position] = None
                     return call
         return None
@@ -159,8 +160,8 @@ class ReplayContext:
             # carrying an API key would print it into the CI log.
             safe_arguments = redact_value(arguments, self._redact_keys)
             raise ReplayError(
-                f"no unserved recorded result for tool {name!r} with arguments "
-                f"{safe_arguments!r}. Recorded path was {self._golden.tool_sequence}. "
+                f"no recorded result for tool {name!r} with arguments {safe_arguments!r} "
+                f"remains unserved. Recorded path was {self._golden.tool_sequence}. "
                 f"Either the agent's behaviour changed, or the trace needs "
                 f"re-recording. To verify an intentional new step without "
                 f"re-recording, pass extra_tools={{{name!r}: <result>}}."
