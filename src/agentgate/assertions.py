@@ -33,6 +33,7 @@ from agentgate.constraints import (
 )
 from agentgate.injection import check_no_injected_content
 from agentgate.normalize import Normalizer
+from agentgate.pricing import is_priced
 from agentgate.trace import Trace
 from agentgate.violations import Severity, Violation, has_errors
 
@@ -50,6 +51,7 @@ __all__ = [
     "check_no_injected_content",
     "check_no_tool_errors",
     "check_output_similarity",
+    "check_pricing_coverage",
     "check_required_tools",
     "check_step_count",
     "check_tool_arguments",
@@ -110,7 +112,10 @@ def check_tool_arguments(
         filtered = {k: v for k, v in arguments.items() if k.lower() not in ignored}
         return normalizer.value(filtered) if normalizer else filtered
 
-    for expected_call, actual_call in zip(golden.tool_calls, observed.tool_calls):
+    # Unequal lengths are expected and are not this check's business: a missing
+    # or added call is a sequence divergence, reported by check_tool_sequence.
+    pairs = zip(golden.tool_calls, observed.tool_calls, strict=False)
+    for expected_call, actual_call in pairs:
         if expected_call.name != actual_call.name:
             continue  # a sequence divergence, already reported by its own check
         expected_args = prepare(expected_call.arguments)
@@ -160,6 +165,7 @@ def check_output_similarity(
     observed: Trace,
     threshold: float = DEFAULT_SIMILARITY,
     *,
+    normalizer: Normalizer | None = None,
     severity: Severity = "error",
 ) -> list[Violation]:
     """Compare final outputs, tolerating rewording.
@@ -171,8 +177,18 @@ def check_output_similarity(
 
     For meaning-sensitive wording, use :class:`OutputPolicy` with explicit
     required and forbidden phrases. That is a real check; this is a smoke alarm.
+
+    `normalizer` is applied to both sides first. Without it, a reference number
+    or timestamp inside an otherwise identical sentence drags the score down and
+    fails the build for no behavioural reason.
     """
-    score = similarity(golden.final_output, observed.final_output)
+    expected = golden.final_output
+    actual = observed.final_output
+    if normalizer is not None:
+        expected = normalizer.text(expected)
+        actual = normalizer.text(actual)
+
+    score = similarity(expected, actual)
     if score >= threshold:
         return []
     return [
@@ -258,6 +274,42 @@ def check_cost_ceiling(
     ]
 
 
+def check_pricing_coverage(
+    observed: Trace, *, severity: Severity = "warning"
+) -> list[Violation]:
+    """Model calls with no registered price, and therefore no measured cost.
+
+    An unpriced model costs $0.00, so a cost ceiling over it can never be
+    exceeded and never fires. That is not a passing budget check, it is the
+    absence of one, and the two should not look identical in a report.
+
+    A warning rather than an error: not knowing a price is a gap in
+    configuration, not a regression in the agent.
+    """
+    unpriced = sorted(
+        {
+            call.model
+            for call in observed.model_calls
+            if not is_priced(call.model) and (call.input_tokens or call.output_tokens)
+        }
+    )
+    if not unpriced:
+        return []
+    return [
+        Violation(
+            code="cost_unpriced",
+            message=(
+                f"cost ceiling cannot be enforced for {unpriced}: no pricing registered, "
+                f"so these calls are counted as $0.00. "
+                f"Register them with agentgate.pricing.register_model()."
+            ),
+            severity=severity,
+            expected=None,
+            actual=unpriced,
+        )
+    ]
+
+
 def check_latency_budget(
     observed: Trace, maximum_ms: float, *, severity: Severity = "error"
 ) -> list[Violation]:
@@ -337,6 +389,7 @@ class Policy(BaseModel):
                 golden,
                 observed,
                 self.output_similarity,
+                normalizer=self.normalize,
                 severity=self.output_similarity_severity,
             )
 
@@ -354,6 +407,7 @@ class Policy(BaseModel):
             violations += constraint.check(observed)
         if self.max_cost_usd is not None:
             violations += check_cost_ceiling(observed, self.max_cost_usd)
+            violations += check_pricing_coverage(observed)
         if self.max_latency_ms is not None:
             violations += check_latency_budget(observed, self.max_latency_ms)
 
