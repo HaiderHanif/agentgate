@@ -45,11 +45,23 @@ def known_models() -> list[str]:
     return sorted(_PRICES)
 
 
+def is_priced(model: str) -> bool:
+    """Whether this model participates in cost assertions at all.
+
+    Worth asking explicitly. An unpriced model costs $0.00, which means a cost
+    ceiling over that model can never be exceeded and therefore never fires.
+    A ceiling that cannot fire looks identical to a ceiling that passes.
+    """
+    return model in _PRICES
+
+
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate the USD cost of one model call.
 
     Unknown models cost 0.0 rather than raising: a missing price should never
     break a test run, it should simply not participate in cost assertions.
+    Callers that assert on cost should pair this with :func:`is_priced` so the
+    absence of a price is visible rather than silently comfortable.
     """
     price = _PRICES.get(model)
     if price is None:

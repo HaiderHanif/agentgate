@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
@@ -37,6 +37,10 @@ class Normalizer(BaseModel):
     Every rule is opt-out, and `custom` accepts project-specific patterns:
 
         Normalizer(custom={"order_id": r"ORD-\\d+"})
+
+    Custom patterns are validated when the Normalizer is built, not when it is
+    first used. A bad pattern should fail at configuration time, in the line
+    that wrote it, rather than halfway through a CI run.
     """
 
     uuids: bool = True
@@ -46,8 +50,25 @@ class Normalizer(BaseModel):
     signed_urls: bool = True
     custom: dict[str, str] = Field(default_factory=dict)
 
+    @field_validator("custom")
+    @classmethod
+    def _patterns_must_compile(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, pattern in value.items():
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"custom normalisation pattern {name!r} is not a valid regular "
+                    f"expression: {exc}"
+                ) from exc
+        return value
+
     def text(self, value: str) -> str:
-        """Normalise a single string."""
+        """Normalise a single string.
+
+        Custom patterns run first, so a project-specific rule can claim a
+        substring before a broader built-in rule rewrites it.
+        """
         result = value
         for name, pattern in self.custom.items():
             result = re.sub(pattern, PLACEHOLDER.format(kind=name), result)
