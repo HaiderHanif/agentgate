@@ -42,6 +42,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help="Directory holding golden traces. Overrides [tool.agentgate] trace_dir.",
     )
+    group.addoption(
+        "--agentgate-allow-missing",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip instead of failing when a golden trace has not been recorded. "
+            "Intended for first adoption only - it disables the gate."
+        ),
+    )
     parser.addini("agentgate_trace_dir", "Directory holding golden traces.", default="")
 
 
@@ -63,6 +72,10 @@ class GoldenTraceMismatch(AssertionError):
     """Raised when replayed behaviour violates the policy."""
 
 
+class MissingGoldenTrace(AssertionError):
+    """Raised when the golden trace a test gates on does not exist."""
+
+
 @dataclass
 class GoldenRunner:
     """The `agentgate` fixture."""
@@ -70,19 +83,36 @@ class GoldenRunner:
     trace_dir: Path
     update: bool
     config: Config
+    allow_missing: bool = False
 
     def path_for(self, name: str) -> Path:
         return self.trace_dir / f"{name}.json"
 
     def load(self, name: str) -> Trace:
-        """Load a golden trace, skipping the test if it has not been recorded."""
+        """Load a golden trace, failing if it has not been recorded.
+
+        This used to skip. Skipping was the wrong default by a wide margin: a
+        deleted trace, a bad path, or a trace that never got committed would
+        remove the gate entirely and still report a green build. A gate that
+        vanishes silently is worse than no gate, because the team believes it is
+        still there.
+
+        `--agentgate-allow-missing` restores the old behaviour for teams
+        adopting agentgate incrementally, where it is a deliberate choice rather
+        than an accident.
+        """
         path = self.path_for(name)
-        if not path.is_file():
-            pytest.skip(
-                f"no golden trace at {path}. Record one with "
-                f"agentgate record, or run pytest --agentgate-update."
-            )
-        return load_trace(path)
+        if path.is_file():
+            return load_trace(path)
+
+        message = (
+            f"no golden trace at {path}. Record one with `agentgate record`, or run "
+            f"`pytest --agentgate-update`. If this scenario is not recorded yet and "
+            f"you want the suite to pass anyway, pass --agentgate-allow-missing."
+        )
+        if self.allow_missing:
+            pytest.skip(message)
+        raise MissingGoldenTrace(message)
 
     def record(self, name: str, agent: Callable[[Any], str], live: LiveSpec) -> Trace:
         """Capture a fresh golden trace and write it to disk."""
@@ -151,4 +181,5 @@ def agentgate(request: pytest.FixtureRequest) -> GoldenRunner:
         trace_dir=trace_dir,
         update=bool(request.config.getoption("--agentgate-update")),
         config=config,
+        allow_missing=bool(request.config.getoption("--agentgate-allow-missing")),
     )

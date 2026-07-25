@@ -16,13 +16,19 @@ inputs:
   max-cost:
     description: "Cost ceiling for the run, in USD"
     required: false
+    default: ""
   max-latency:
     description: "Latency budget for the run, in milliseconds"
     required: false
+    default: ""
   similarity:
     description: "Final output similarity threshold, 0 to 1"
     required: false
     default: "0.85"
+  require-signature:
+    description: "Refuse to verify a trace that is unsigned or tampered with"
+    required: false
+    default: "false"
   python-version:
     description: "Python version used to run the check"
     required: false
@@ -35,18 +41,51 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
+    # Installs the action's own checked-out source rather than a release from
+    # PyPI. Without this, pinning `uses: HaiderHanif/agentgate@<sha>` pins the
+    # action definition but not the code it runs, so a compromised or simply
+    # newer PyPI release would execute inside a workflow that believed itself
+    # pinned.
     - name: Install agentgate
       shell: bash
-      run: python -m pip install --upgrade pip agentgate
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade pip
+        python -m pip install "$GITHUB_ACTION_PATH"
 
+    # Inputs are passed through the environment and assembled into a quoted
+    # array. They are never interpolated into shell source, so quotes, command
+    # substitutions, newlines and glob characters in an input are inert data.
     - name: Verify agent against golden trace
       shell: bash
+      env:
+        AGENTGATE_AGENT: ${{ inputs.agent }}
+        AGENTGATE_TRACE: ${{ inputs.trace }}
+        AGENTGATE_SIMILARITY: ${{ inputs.similarity }}
+        AGENTGATE_MAX_COST: ${{ inputs.max-cost }}
+        AGENTGATE_MAX_LATENCY: ${{ inputs.max-latency }}
+        AGENTGATE_REQUIRE_SIGNATURE: ${{ inputs.require-signature }}
       run: |
-        ARGS="${{ inputs.agent }} ${{ inputs.trace }} --similarity ${{ inputs.similarity }}"
-        if [ -n "${{ inputs.max-cost }}" ]; then
-          ARGS="$ARGS --max-cost ${{ inputs.max-cost }}"
+        set -euo pipefail
+
+        args=(
+          verify
+          "$AGENTGATE_AGENT"
+          "$AGENTGATE_TRACE"
+          --similarity "$AGENTGATE_SIMILARITY"
+          --github
+        )
+
+        if [ -n "$AGENTGATE_MAX_COST" ]; then
+          args+=(--max-cost "$AGENTGATE_MAX_COST")
         fi
-        if [ -n "${{ inputs.max-latency }}" ]; then
-          ARGS="$ARGS --max-latency ${{ inputs.max-latency }}"
+
+        if [ -n "$AGENTGATE_MAX_LATENCY" ]; then
+          args+=(--max-latency "$AGENTGATE_MAX_LATENCY")
         fi
-        agentgate verify $ARGS
+
+        if [ "$AGENTGATE_REQUIRE_SIGNATURE" = "true" ]; then
+          args+=(--require-signature)
+        fi
+
+        agentgate "${args[@]}"

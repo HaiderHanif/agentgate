@@ -11,6 +11,8 @@ configuration at all still behaves sensibly.
     [tool.agentgate.policy]
     max_cost_usd = 0.05
     forbidden_tools = ["delete_customer"]
+
+Unknown keys are rejected rather than ignored - see :class:`Config`.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agentgate.assertions import Policy
 from agentgate.exceptions import ConfigError
@@ -34,7 +36,16 @@ PYPROJECT = "pyproject.toml"
 
 
 class Config(BaseModel):
-    """Resolved agentgate configuration for a project."""
+    """Resolved agentgate configuration for a project.
+
+    Unknown keys are an error. Pydantic's default is to ignore them, which meant
+    a misspelled `polciy = { forbidden_tools = [...] }` loaded successfully and
+    silently discarded every restriction inside it. Configuration that fails
+    open is indistinguishable from configuration that works, and the failure
+    only becomes visible when the gate does not stop something.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     trace_dir: Path = Path("traces")
     strict: bool = True
@@ -74,4 +85,7 @@ def load_config(start: Path | None = None) -> Config:
     try:
         return Config.model_validate(section)
     except ValidationError as exc:
-        raise ConfigError(f"invalid [tool.agentgate] configuration in {pyproject}:\n{exc}") from exc
+        raise ConfigError(
+            f"invalid [tool.agentgate] configuration in {pyproject}:\n{exc}\n"
+            f"Valid keys are: {sorted(Config.model_fields)}"
+        ) from exc
