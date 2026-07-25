@@ -4,7 +4,11 @@
     agentgate list                       show golden traces in the project
     agentgate show traces/refund.json    inspect one trace
     agentgate record app:agent ...       capture a new golden trace
+    agentgate sign traces/refund.json    sign a trace so tampering is detectable
+    agentgate scan traces/refund.json    look for injection payloads in a trace
     agentgate verify app:agent trace     replay and gate on behaviour
+
+Exit codes are stable and CI-friendly: 0 clean, 1 violations, 2 usage error.
 """
 
 from __future__ import annotations
@@ -22,6 +26,15 @@ from agentgate import __version__
 from agentgate.assertions import Policy, has_errors
 from agentgate.config import PYPROJECT, load_config
 from agentgate.exceptions import AgentGateError
+from agentgate.injection import scan_trace
+from agentgate.integrity import (
+    SIGNING_KEY_ENV,
+    IntegrityError,
+    fingerprint,
+    is_signed,
+    sign_trace,
+    verify_trace,
+)
 from agentgate.recorder import record_run
 from agentgate.replay import replay_run
 from agentgate.reporting import github_annotations, render_report
@@ -96,14 +109,14 @@ def list_traces(
         raise typer.Exit(EXIT_OK)
 
     table = Table(title=f"golden traces in {target}", header_style="bold")
-    for column in ("name", "agent", "tools", "steps", "cost", "recorded"):
+    for column in ("name", "agent", "tools", "steps", "cost", "signed", "recorded"):
         table.add_column(column)
 
     for path in paths:
         try:
             trace = load_trace(path)
         except AgentGateError as exc:
-            table.add_row(path.stem, f"[red]unreadable[/red] {exc}", "-", "-", "-", "-")
+            table.add_row(path.stem, f"[red]unreadable[/red] {exc}", "-", "-", "-", "-", "-")
             continue
         table.add_row(
             trace.name,
@@ -111,6 +124,7 @@ def list_traces(
             " -> ".join(trace.tool_sequence) or "-",
             str(len(trace.steps)),
             f"${trace.total_cost_usd:.4f}",
+            "yes" if is_signed(trace) else "[yellow]no[/yellow]",
             trace.created_at.strftime("%Y-%m-%d"),
         )
     console.print(table)
@@ -187,6 +201,84 @@ def record(
     )
     console.print(f"  cost ${trace.total_cost_usd:.4f}  tokens {trace.total_tokens}")
 
+    findings = scan_trace(trace)
+    if findings:
+        err_console.print(
+            f"  [yellow]warning[/yellow] {len(findings)} possible injection payload(s) "
+            "recorded; run 'agentgate scan' before approving this trace"
+        )
+
+
+@app.command()
+def sign(
+    path: Path = typer.Argument(..., help="Golden trace to sign in place."),
+    key: Optional[str] = typer.Option(
+        None, "--key", help=f"Signing key. Defaults to ${SIGNING_KEY_ENV}."
+    ),
+) -> None:
+    """Sign a golden trace so later tampering is detectable.
+
+    A golden trace defines what "correct" means, so an attacker who can edit one
+    can make broken behaviour look approved. Signing does not replace code review
+    and CODEOWNERS on the trace directory; it catches the cases where they fail.
+    """
+    try:
+        trace = load_trace(path)
+        signed = sign_trace(trace, key)
+    except AgentGateError as exc:
+        _fail(str(exc))
+        return
+
+    path.write_text(signed.to_json(), encoding="utf-8")
+    console.print(f"[green]signed[/green] {path}")
+    console.print(f"  fingerprint {fingerprint(signed)[:16]}")
+
+
+@app.command()
+def scan(
+    paths: list[Path] = typer.Argument(..., help="Golden traces to scan."),
+    require_signature: bool = typer.Option(
+        False, "--require-signature", help="Also fail if a trace is unsigned or tampered with."
+    ),
+    key: Optional[str] = typer.Option(
+        None, "--key", help=f"Signing key. Defaults to ${SIGNING_KEY_ENV}."
+    ),
+) -> None:
+    """Audit golden traces for injection payloads and, optionally, signatures.
+
+    Detection is heuristic: it reports what a human should look at, and cannot
+    decide intent. Findings are printed, not silently swallowed.
+    """
+    problems = 0
+
+    for path in paths:
+        try:
+            trace = load_trace(path)
+        except AgentGateError as exc:
+            err_console.print(f"[red]unreadable[/red] {path}: {exc}")
+            problems += 1
+            continue
+
+        if require_signature:
+            try:
+                verify_trace(trace, key)
+            except IntegrityError as exc:
+                err_console.print(f"[red]integrity[/red] {path}: {exc}")
+                problems += 1
+
+        findings = scan_trace(trace)
+        for finding in findings:
+            err_console.print(
+                f"[yellow]injection[/yellow] {path}: {finding.pattern} "
+                f"at {finding.location}\n    {finding.excerpt!r}"
+            )
+        problems += len(findings)
+
+        if not findings:
+            console.print(f"[green]clean[/green] {path}")
+
+    raise typer.Exit(EXIT_VIOLATIONS if problems else EXIT_OK)
+
 
 @app.command()
 def verify(
@@ -196,6 +288,14 @@ def verify(
     report: Optional[Path] = typer.Option(None, "--report", help="Also write the report here."),
     strict: bool = typer.Option(True, "--strict/--no-strict", help="Match tool arguments exactly."),
     github: bool = typer.Option(False, "--github", help="Emit GitHub Actions annotations."),
+    require_signature: bool = typer.Option(
+        False,
+        "--require-signature",
+        help="Refuse to run against an unsigned or tampered trace.",
+    ),
+    key: Optional[str] = typer.Option(
+        None, "--key", help=f"Signing key. Defaults to ${SIGNING_KEY_ENV}."
+    ),
     max_cost: Optional[float] = typer.Option(None, "--max-cost", help="Cost ceiling in USD."),
     max_latency: Optional[float] = typer.Option(
         None, "--max-latency", help="Latency budget in milliseconds."
@@ -217,6 +317,15 @@ def verify(
     except AgentGateError as exc:
         _fail(str(exc))
         return
+
+    if require_signature:
+        try:
+            verify_trace(golden, key)
+        except IntegrityError as exc:
+            err_console.print(f"[bold red]integrity[/bold red] {exc}")
+            if github:
+                print(f"::error file={trace_path}::[integrity] {exc}")
+            raise typer.Exit(EXIT_VIOLATIONS) from exc
 
     policy = config.policy.model_copy(deep=True)
     if max_cost is not None:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentgate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Regression gating for AI agents: golden-trace recording, deterministic replay, and CI gates."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -84,6 +84,7 @@ ignore = ["B008"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ARG001", "ARG002"]
 "examples/*" = ["ARG001"]
+"src/agentgate/cli.py" = ["UP006", "UP007"]
 
 [tool.mypy]
 python_version = "3.10"
