@@ -1,198 +1,149 @@
 # FAQ
 
-Direct answers to the questions that get asked in public.
+The questions worth asking, including the ones without a good answer yet. A FAQ
+that only asks flattering questions is a brochure.
+
+---
 
 ## Positioning
 
-### Isn't this just mocked integration testing?
+### Why not just use LangSmith, Langfuse, Braintrust or Weave?
 
-The mechanism is similar. The problem is not.
+Those are observability and evaluation platforms: they show you what happened
+and score outputs, usually against a dataset and often with an LLM judge.
+agentgate does one narrower thing - it **fails a build when an agent's behaviour
+changes** - and it is a library, not a service. No account, no data leaving the
+machine, no LLM in the assertion path.
 
-A mocked integration test asserts that a deterministic function produces an
-expected value. agentgate asserts that a **probabilistic decision-maker** takes
-an acceptable sequence of actions, where the acceptable set is broader than one
-exact answer and narrower than anything-goes.
+They are complementary. Observability tells you what your agent did in
+production. agentgate stops a pull request from changing it.
 
-That difference is where the actual work lives: severity levels, ordering
-constraints rather than exact sequences, argument bounds, cost budgets,
-normalisation of volatile values, and similarity tolerances on output. None of
-that exists in `unittest.mock`, because deterministic code does not need it.
+### Why not Promptfoo, DeepEval, Ragas or OpenAI Evals?
 
-If your agent is deterministic, you do not need agentgate. Use `unittest.mock`.
+Those evaluate **output quality** against a dataset - is this answer good? That
+is a different question from **did this agent's decision path change since the
+commit that worked?** Evals grade the answer. agentgate diffs the behaviour: the
+tools called, their order, their arguments, the cost, and what was said.
 
-### Why not LangSmith, Langfuse, Braintrust, or Promptfoo?
+An agent can produce a perfectly good answer while calling the refund API twice.
 
-Different question, different answer:
+### Is this just mocked integration testing?
 
-| Tool class | Question it answers |
-| :--- | :--- |
-| Observability (LangSmith, Langfuse) | what happened in production? |
-| Evals (Promptfoo, DeepEval, Ragas) | how good is the output? |
-| **agentgate** | **did behaviour change since the last approved run?** |
+Largely yes, and the honest version of the pitch says so. The contributions are
+the trace format, deterministic replay, the assertion vocabulary for agent-shaped
+behaviour, and CI wiring with signed traces. If you already have disciplined
+mocked integration tests around your agent, you have most of the value.
 
-Observability tells you after the fact. Evals score quality on a rubric, need a
-judge model, cost money per run, and are too slow and too noisy to block every
-commit.
+---
 
-agentgate is a binary gate: free, offline, deterministic, millisecond-fast, and
-cheap enough to run on every push. It is the unit test in that stack, not the
-report.
+## Method
 
-Most serious teams should run all three. They are complements.
+### One golden trace is one run that happened to work. Isn't that a weak oracle?
 
-### Why is this better than a normal integration test?
+Yes. See [limitations](limitations.md#1-the-oracle-problem-agentgate-does-not-know-what-correct-means).
+This is the strongest criticism of the approach and the reason absolute
+constraints exist. A golden trace pins the shape of a run; an
+`ArgumentConstraint` or `OutputPolicy` states a requirement that is true whether
+or not the recording was any good. **Constraints, not comparison, are the real
+answer to the oracle problem.** Comparison is the cheap first layer.
 
-It is not better. It covers something a normal integration test structurally
-cannot: the *order and shape of decisions* a non-deterministic component makes.
-Write both.
+### Doesn't this just teach the agent to pass the test?
 
-## Technical
+It can. A suite of golden traces is a specification of past behaviour, and
+optimising against it produces an agent that reproduces the past. Mitigate the
+same way you would anywhere else: keep scenarios adversarial, add cases from
+real incidents, and rely on absolute constraints that encode requirements rather
+than recordings.
 
-### How do you ensure replay is deterministic?
+### What if a change is an improvement, not a regression?
 
-Model responses and tool results are served from the recording, so neither the
-network nor the model can introduce variance. `deterministic()` freezes `time`,
-seeds `random`, and makes `uuid4` reproducible for non-determinism inside the
-agent's own code.
+agentgate cannot tell the difference and does not try. It reports that behaviour
+changed and makes a human decide. Accept the new behaviour by re-recording:
 
-What that does not cover is documented in [limitations](limitations.md). The
-strongest guarantee is replay in a network-isolated container.
+```bash
+pytest --agentgate-update
+```
 
-### What exactly is recorded?
+The diff then shows up in code review, which is where the judgement belongs.
 
-Per model call: model name, prompt **digest** (not the prompt), response text,
-input and output token counts, cost, latency.
+### Two different tool sequences can both be correct. Doesn't strict ordering break refactors?
 
-Per tool call: name, arguments, result, latency, and error if it raised.
+Yes, which is why `tool_sequence` is switchable and `Ordering` /
+`UnorderedGroup` exist. Use `UnorderedGroup` for genuinely order-independent
+work and `Ordering` for the one relationship that matters ("verify before
+refund"). Whole-sequence matching is the blunt default, not the recommendation.
 
-Per trace: schema version, name, agent, creation time, final output, metadata.
+### Will false positives destroy trust in the tool?
 
-Prompts are digested rather than stored, so proprietary prompt text never enters
-a committed artifact.
+That is the main adoption risk, and it is why every check has a `severity`.
+Opinion-shaped checks like output similarity can report as `warning` and never
+block a merge, so developers do not learn to ignore red. Use the `Normalizer`
+for volatile values rather than loosening thresholds.
 
-### How do you handle stateful tools?
+### What about false negatives?
 
-Only partially, and this is a real limitation. agentgate records the tool
-boundary, not the state behind it. Replay reproduces what the tool returned; it
-cannot verify the world still works that way. Cover the other half with contract
-tests on your tools.
+Worse, and harder to see. A green run means "the recorded scenarios did not
+regress" - nothing more. The failure modes agentgate structurally cannot catch
+are listed in [limitations](limitations.md).
 
-### How do you handle parallel tool calls?
+---
 
-Unsupported. Concurrent calls have no deterministic order, so there is nothing
-stable to assert against. Better to be explicitly unsupported than quietly wrong.
+## Security and privacy
 
-### How do you handle streaming?
+### Traces contain sensitive data. What protects them?
 
-Recording captures the assembled response, not the chunk sequence. Chunk-level
-regressions are out of scope.
+`redact_trace` runs by default on save, masking by key and by value pattern
+across tool arguments, tool results, model response text and the final output.
+It is best-effort, not a compliance control - see
+[limitations §6](limitations.md#6-redaction-is-best-effort). **Do not record
+traces against production data.**
 
-### How do you compare semantic meaning?
+### Can someone weaken a gate by editing a trace?
 
-Honestly: it does not, and it says so. `output_similarity` is lexical. For
-meaning-critical wording, use explicit `OutputPolicy` phrase rules. A required
-phrase is a check you can reason about; an embedding score is a number you have
-to trust.
+Yes, unless you stop them. That is what signing is for:
 
-### How do you avoid false positives?
+```bash
+export AGENTGATE_SIGNING_KEY=...      # a CI secret, never committed
+agentgate sign traces/refund_flow.json
+agentgate scan traces/ --require-signature
+```
 
-False positives are the failure mode that kills adoption, so several features
-exist only to prevent them: `Normalizer` for UUIDs, timestamps, and signed URLs;
-`ignore_arguments` for volatile keys; `Ordering` constraints instead of exact
-sequence matching; `severity="warning"` for opinion-shaped checks; and
-`--agentgate-update` so intentional changes take one command.
+A tampered trace is rejected before replay runs. This only binds if the verify
+job is a **required** status check on a protected branch and `traces/` is under
+CODEOWNERS review. A gate a pull request can switch off is not a gate.
 
-### How do you avoid false negatives?
+### What if a recorded tool result contains a prompt injection?
 
-By not relying on comparison alone. Comparative checks inherit the golden run's
-blind spots. Absolute constraints - `required_tools`, `forbidden_tools`,
-`Ordering`, `ArgumentConstraint`, `OutputPolicy`, cost ceilings - hold
-independently of what the recording did.
+Replay feeds recorded results back verbatim, so it can replay an injection.
+`Policy(detect_injection=True)` scans for known patterns and reports findings.
+Pattern matching is a signal, not a defence - treat traces from outside your
+team as hostile input and review them like code.
 
-The repository's own test suite includes each named red-team scenario:
-right-tool-wrong-amount, correct-actions-harmful-sentence, and
-said-it-happened-without-doing-it.
+### Does replay sandbox my agent?
 
-### How do you handle tool schema changes?
+No. Your agent code runs with the privileges of the process that invoked it.
+agentgate removes network calls to the model and tools; it does not contain
+anything else your code does.
 
-Badly, deliberately. A renamed parameter is an argument change, so replay stops
-and reports it rather than guessing. Re-record after a schema change; the diff is
-the review artifact.
+---
 
-### How do you handle model upgrades?
+## Practical
 
-Swap the model and re-record. The trace diff shows what the new model does
-differently in decision terms, which is usually more informative than an eval
-score moving by two points.
+### How much work is adoption?
 
-## Security
+Your agent must accept a context object and call `ctx.model(...)` and
+`ctx.tool(...)`. That indirection is the real cost, and for an existing codebase
+it is not free. There are adapters for the OpenAI and Anthropic message shapes;
+LangChain, LlamaIndex, CrewAI, AutoGen and the Vercel AI SDK are not covered yet.
 
-### Do traces contain secrets? Do you redact PII?
+### Do traces need constant maintenance?
 
-They can, which is why redaction runs on write with a default key list and prompts
-are stored only as digests. Redaction is key-name based, so it will not catch a
-card number in a free-text field. Read your first trace before committing it.
+They need re-recording whenever behaviour intentionally changes, which is the
+same cost as any snapshot test. Keep traces small and scenario-focused. A trace
+covering twelve steps of unrelated work will need re-recording constantly and
+will teach the team to re-record without reading the diff.
 
-### Can traces be poisoned?
+### Does it run offline?
 
-Yes, and it is the most serious attack on the design: rewrite the baseline and
-broken behaviour passes forever. Defences are CODEOWNERS on the trace directory,
-HMAC signing via `agentgate sign`, protected branches with required checks, and
-reviewing trace diffs as behaviour changes. See [limitations](limitations.md).
-
-### How do you sandbox replay?
-
-agentgate does not sandbox. Replay avoids your real tools but still executes your
-agent code in-process. Use the Docker image for untrusted code. Claiming
-isolation the tool does not provide would be worse than saying this plainly.
-
-### How do you prevent CI bypass?
-
-That is a repository-settings problem, not a library problem: required status
-checks, protected branches, CODEOWNERS, and reviewing workflow changes. agentgate
-can report a finding; it cannot stop someone with write access from deleting the
-job.
-
-### How do you handle prompt injection in recorded tool outputs?
-
-`Policy(detect_injection=True)` scans replayed tool results for known injection
-shapes and reports them as warnings. Heuristic, not a filter - the goal is to stop
-a payload from silently becoming your approved baseline.
-
-## Product
-
-### How much maintenance do traces require?
-
-One command when behaviour changes intentionally (`pytest --agentgate-update`),
-plus reviewing the resulting diff.
-
-The cost scales with how strict your policies are. Teams that lean on `Ordering`
-and `ArgumentConstraint` rather than whole-sequence matching re-record far less
-often, because unrelated refactors stop triggering failures.
-
-### What if multiple behaviours are valid?
-
-That is what constraints are for. "Refund before emailing" as an `Ordering` rule
-accepts every implementation that respects the invariant, including ones that add
-an audit step or ask for confirmation first. Whole-sequence matching would reject
-both improvements.
-
-### What if the agent is correct but says something risky?
-
-`OutputPolicy`. Required disclosures, forbidden phrases, regex rules, PII
-detection, length limits. This was the strongest criticism levelled at the design
-and it is now a first-class check.
-
-### How do developers debug a failure?
-
-The report shows the tool path with each step marked ok, changed, added, or
-missing, then every finding with expected and actual values. In CI those become
-inline pull request annotations. The golden trace is readable JSON, so the last
-resort is reading the file.
-
-### How do you measure coverage?
-
-You cannot, meaningfully, and no tool in this category can. Trace count is not
-coverage. Treat agentgate as protection for the paths you have deliberately
-approved, and use adversarial evals and production sampling to find the paths you
-have not.
+Yes. Replay makes no network calls, so the suite is free, fast, and works in a
+sealed CI runner.
