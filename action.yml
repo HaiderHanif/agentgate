@@ -1,0 +1,52 @@
+name: "agentgate"
+description: "Fail the build when an AI agent's behaviour diverges from its golden trace."
+author: "Haider Hanif"
+
+branding:
+  icon: "shield"
+  color: "gray-dark"
+
+inputs:
+  agent:
+    description: "Agent entrypoint as module:callable"
+    required: true
+  trace:
+    description: "Path to the golden trace JSON file"
+    required: true
+  max-cost:
+    description: "Cost ceiling for the run, in USD"
+    required: false
+  max-latency:
+    description: "Latency budget for the run, in milliseconds"
+    required: false
+  similarity:
+    description: "Final output similarity threshold, 0 to 1"
+    required: false
+    default: "0.85"
+  python-version:
+    description: "Python version used to run the check"
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install agentgate
+      shell: bash
+      run: python -m pip install --upgrade pip agentgate
+
+    - name: Verify agent against golden trace
+      shell: bash
+      run: |
+        ARGS="${{ inputs.agent }} ${{ inputs.trace }} --similarity ${{ inputs.similarity }}"
+        if [ -n "${{ inputs.max-cost }}" ]; then
+          ARGS="$ARGS --max-cost ${{ inputs.max-cost }}"
+        fi
+        if [ -n "${{ inputs.max-latency }}" ]; then
+          ARGS="$ARGS --max-latency ${{ inputs.max-latency }}"
+        fi
+        agentgate verify $ARGS

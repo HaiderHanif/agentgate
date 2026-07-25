@@ -10,8 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from agentgate.trace import ModelCall, Recorder_ignore  # type: ignore[attr-defined] # noqa: F401
-from agentgate.trace import ToolCall, Trace, digest
+from agentgate.trace import ModelCall, ToolCall, Trace, digest
 
 
 class ReplayError(RuntimeError):
@@ -52,7 +51,7 @@ class ReplayContext:
         self.observed.steps.append(
             ModelCall(
                 index=self._next_index,
-                model=model or recorded.model,
+                model=model if model != "unknown" else recorded.model,
                 prompt_digest=digest(prompt),
                 response_text=recorded.response_text,
                 input_tokens=recorded.input_tokens,
