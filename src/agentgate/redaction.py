@@ -9,12 +9,15 @@ Two mechanisms, because one is not enough:
 1. **By key** - any mapping entry whose key looks sensitive (`api_key`,
    `password`). Precise, and the right tool for structured arguments.
 2. **By value** - patterns that match a secret wherever it appears in free
-   text. Necessary because the most likely place for a card number to leak is
-   the sentence the agent wrote, which has no key at all.
+   text. Necessary because the likeliest place for a card number to leak is the
+   sentence the agent wrote, or an exception message, neither of which has a key.
 
 Tool *arguments* are redacted by key only. Rewriting free text inside arguments
 would change what the agent is recorded as having asked for, and replay matches
 on arguments.
+
+This is a best-effort control that reduces the blast radius of a mistake. It is
+not a compliance boundary. Do not record traces against production data.
 """
 
 from __future__ import annotations
@@ -65,6 +68,22 @@ def _matches(key: str, needles: Sequence[str]) -> bool:
     return any(needle in lowered for needle in needles)
 
 
+def resolve_keys(keys: Iterable[str] | None) -> list[str]:
+    """Combine caller-supplied keys with the secure defaults.
+
+    Custom keys **augment** the defaults rather than replacing them. Replacement
+    was the earlier behaviour and it was a trap: adding `customer_email` to the
+    list silently stopped masking `password`, `token` and `api_key`. Widening a
+    redaction list should never narrow it.
+
+    Disabling redaction is still possible, but it has to be deliberate - pass an
+    empty sequence, which callers handle before reaching here.
+    """
+    if keys is None:
+        return [k.lower() for k in DEFAULT_REDACT_KEYS]
+    return sorted({k.lower() for k in DEFAULT_REDACT_KEYS} | {k.lower() for k in keys})
+
+
 def redact_text(text: str, patterns: Mapping[str, re.Pattern[str]] | None = None) -> str:
     """Mask secrets that appear inside free text."""
     active = SENSITIVE_VALUE_PATTERNS if patterns is None else patterns
@@ -104,17 +123,20 @@ def redact_strings(value: Any) -> Any:
 def redact_trace(trace: Trace, keys: Iterable[str] | None = None) -> Trace:
     """Return a copy of `trace` with sensitive values masked.
 
-    Tool arguments are masked by key. Tool results, model response text, and the
-    final output are masked by key *and* by value pattern, because those are
-    free text that no key protects.
+    Covered: tool arguments (by key), tool results, tool error messages, model
+    response text, the final output, and trace metadata.
+
+    Exception text earns particular attention. It is free-form, rarely reviewed,
+    and routinely contains an authorization header, a URL with a token in the
+    query string, a response body, or a customer record.
 
     Passing an explicit empty sequence disables redaction entirely, which is
-    occasionally the right call for a trace that never leaves the machine.
+    occasionally right for a trace that never leaves the machine.
     """
     if keys is not None and not list(keys):
         return trace
 
-    needles = [k.lower() for k in (keys if keys is not None else DEFAULT_REDACT_KEYS)]
+    needles = resolve_keys(keys)
     steps: list[ModelCall | ToolCall] = []
     for step in trace.steps:
         if isinstance(step, ToolCall):
@@ -123,6 +145,7 @@ def redact_trace(trace: Trace, keys: Iterable[str] | None = None) -> Trace:
                     update={
                         "arguments": redact_value(step.arguments, needles),
                         "result": redact_strings(redact_value(step.result, needles)),
+                        "error": redact_text(step.error) if step.error else step.error,
                     }
                 )
             )
@@ -131,5 +154,9 @@ def redact_trace(trace: Trace, keys: Iterable[str] | None = None) -> Trace:
                 step.model_copy(update={"response_text": redact_text(step.response_text)})
             )
     return trace.model_copy(
-        update={"steps": steps, "final_output": redact_text(trace.final_output)}
+        update={
+            "steps": steps,
+            "final_output": redact_text(trace.final_output),
+            "metadata": redact_strings(redact_value(trace.metadata, needles)),
+        }
     )
