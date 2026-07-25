@@ -1,44 +1,75 @@
-# Example: refund agent
+# Refund agent example
 
-A three-step agent that looks up an order, issues a refund, and notifies the customer.
-The ordering matters: **never email the customer before the money actually moves.**
+A worked example of the failure agentgate is built to catch.
 
-This example ships with a committed golden trace, and CI verifies the agent against it
-on every pull request.
+## The bug
 
-## Run the verification
+The agent must **issue the refund before emailing the customer**. Swap those two
+lines and:
+
+- every unit test still passes
+- the final output is byte-for-byte identical
+- the token cost is identical
+- the LLM-as-judge score is identical
+
+...and customers get told their money is on the way when it never left. Nothing
+in a conventional test suite looks at the *order of actions*. agentgate does.
+
+## Run it
 
 ```bash
-agentgate verify \
-  examples.refund_agent.agent:refund_agent \
-  examples/refund_agent/traces/refund_flow.json \
-  --max-cost 0.05
+pip install -e ".[dev]"
+pytest examples/refund_agent -v
 ```
 
-Expected output:
+Two tests run. The first replays the correct agent against the committed golden
+trace and passes. The second replays the regressed agent and asserts that the
+gate fires.
+
+## What the gate reports
 
 ```text
 agentgate: refund_flow
 ======================
 
-PASS - 3 tool calls matched the golden trace
+FAIL - 1 behavioural finding(s)
+
+Tool call path
+--------------
+  ok        1. lookup_order
+  changed   2. issue_refund -> send_email
+  changed   3. send_email -> issue_refund
+
+Findings
+--------
+  [error] [tool_sequence] tool call order diverged from the golden trace
+      expected: ['lookup_order', 'issue_refund', 'send_email']
+      actual:   ['lookup_order', 'send_email', 'issue_refund']
 ```
 
-## See a regression get caught
+## Re-recording
 
-`agent.py` also contains `regressed_refund_agent`, which emails before refunding.
-Point the verifier at it:
+When a behaviour change is intentional, re-record and commit the new trace so it
+shows up in code review as a deliberate diff:
 
 ```bash
-agentgate verify \
-  examples.refund_agent.agent:regressed_refund_agent \
-  examples/refund_agent/traces/refund_flow.json
+pytest examples/refund_agent --agentgate-update
+git diff examples/refund_agent/traces/
 ```
 
-It exits non-zero and prints exactly which step moved.
+The golden trace is plain JSON, so a reviewer can see exactly which decision
+changed without running anything.
 
-## Inspect the trace
+## Going live
 
-```bash
-agentgate show examples/refund_agent/traces/refund_flow.json
+`model_fn` here is a stub so the example runs offline and free. To record
+against a real model:
+
+```python
+from openai import OpenAI
+from agentgate.adapters import openai_model_fn
+
+model_fn = openai_model_fn(OpenAI(), model="gpt-4o-mini")
 ```
+
+Recording costs real money and causes real side effects. Replay never does.

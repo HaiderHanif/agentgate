@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from agentgate.recorder import ToolRegistry
-from agentgate.trace import ModelResult, Trace, record_run if False else Trace  # noqa: F401
+from agentgate.trace import ModelResult
 
 pytest_plugins = ["pytester"]
 

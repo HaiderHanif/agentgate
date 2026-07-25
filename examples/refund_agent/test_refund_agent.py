@@ -1,37 +1,32 @@
-"""The example, wired into pytest exactly as a real project would do it."""
+"""The gate itself. Three lines of test for a whole class of silent failure."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-from agentgate import Policy, load_trace, replay_run
-from examples.refund_agent.agent import refund_agent, regressed_refund_agent
-
-GOLDEN = Path(__file__).parent / "traces" / "refund_flow.json"
+from agentgate import Policy
+from agentgate.pytest_plugin import GoldenTraceMismatch
+from examples.refund_agent.agent import LIVE, handle_refund, handle_refund_regressed
 
 POLICY = Policy(
-    required_tools=["lookup_order", "issue_refund"],
-    forbidden_tools=["delete_customer"],
-    max_cost_usd=0.05,
+    required_tools=["issue_refund"],
+    max_cost_usd=0.01,
+    output_similarity=0.85,
 )
 
 
-def test_correct_agent_matches_golden_trace() -> None:
-    golden = load_trace(GOLDEN)
-    observed = replay_run(golden, refund_agent)
-    assert POLICY.evaluate(golden, observed) == []
+def test_refund_flow_is_unchanged(agentgate):
+    """Passes: the agent takes exactly the decision path that was recorded."""
+    agentgate.trace_dir = agentgate.trace_dir  # honours --agentgate-dir
+    agentgate.assert_matches(handle_refund, "refund_flow", POLICY, live=LIVE)
 
 
-def test_regressed_agent_is_rejected() -> None:
-    golden = load_trace(GOLDEN)
-    observed = replay_run(golden, regressed_refund_agent)
-    violations = POLICY.evaluate(golden, observed)
-    assert any(v.code == "tool_sequence" for v in violations)
+def test_reordering_is_caught(agentgate):
+    """Fails loudly: the customer would be emailed before the money moved."""
+    if agentgate.update:
+        pytest.skip("nothing to assert while re-recording")
 
+    with pytest.raises(GoldenTraceMismatch) as excinfo:
+        agentgate.assert_matches(handle_refund_regressed, "refund_flow", POLICY)
 
-@pytest.mark.golden("refund_flow")
-def test_via_plugin(agentgate) -> None:
-    agentgate.trace_dir = GOLDEN.parent
-    agentgate.assert_matches(refund_agent, "refund_flow", POLICY)
+    assert "tool_sequence" in str(excinfo.value)

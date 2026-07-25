@@ -1,48 +1,69 @@
 {
   "schema_version": "1.0",
   "name": "refund_flow",
-  "agent": "refund_agent",
-  "created_at": "2026-07-25T08:00:00Z",
+  "agent": "handle_refund",
+  "created_at": "2026-07-25T09:00:00Z",
   "steps": [
     {
-      "kind": "model",
+      "kind": "tool",
       "index": 0,
-      "model": "gpt-4o-mini",
-      "prompt_digest": "3f9a1c7d2b04",
-      "response_text": "Look up the order, issue the refund, then notify the customer.",
-      "input_tokens": 142,
-      "output_tokens": 24,
-      "cost_usd": 0.0012,
-      "latency_ms": 812.4
+      "name": "lookup_order",
+      "arguments": {
+        "order_id": "A-1042"
+      },
+      "result": {
+        "id": "A-1042",
+        "amount": 49.99,
+        "email": "customer@example.com",
+        "status": "delivered"
+      },
+      "latency_ms": 12.4,
+      "error": null
     },
     {
-      "kind": "tool",
+      "kind": "model",
       "index": 1,
-      "name": "lookup_order",
-      "arguments": { "order_id": "A-1042" },
-      "result": { "id": "A-1042", "amount": 49.0, "status": "delivered" },
-      "latency_ms": 41.2,
-      "error": null
+      "model": "gpt-4o-mini",
+      "prompt_digest": "c41f0a9d7b62",
+      "response_text": "Yes - the order qualifies for a full refund under the 30-day policy.",
+      "input_tokens": 412,
+      "output_tokens": 38,
+      "cost_usd": 8.46e-05,
+      "latency_ms": 843.1
     },
     {
       "kind": "tool",
       "index": 2,
       "name": "issue_refund",
-      "arguments": { "order_id": "A-1042", "amount": 49.0 },
-      "result": { "refund_id": "RF-771", "refunded": 49.0 },
-      "latency_ms": 128.7,
+      "arguments": {
+        "order_id": "A-1042",
+        "amount": 49.99
+      },
+      "result": {
+        "refund_id": "RF-77120",
+        "order_id": "A-1042",
+        "amount": 49.99
+      },
+      "latency_ms": 218.7,
       "error": null
     },
     {
       "kind": "tool",
       "index": 3,
       "name": "send_email",
-      "arguments": { "to": "customer@example.com", "template": "refund_confirmed" },
-      "result": { "sent": true, "to": "customer@example.com", "template": "refund_confirmed" },
-      "latency_ms": 96.3,
+      "arguments": {
+        "to": "customer@example.com"
+      },
+      "result": {
+        "delivered": true,
+        "to": "customer@example.com"
+      },
+      "latency_ms": 96.2,
       "error": null
     }
   ],
-  "final_output": "Refund of $49.00 issued for order A-1042. Confirmation emailed to customer@example.com.",
-  "metadata": { "source": "worked example", "synthetic": true }
+  "final_output": "Refunded $49.99 for order A-1042. Yes - the order qualifies for a full refund under the 30-day policy.",
+  "metadata": {
+    "example": true
+  }
 }
