@@ -1,72 +1,107 @@
 # Architecture
 
-## Design goal
+agentgate is small on purpose. Five ideas hold it together.
 
-Make agent behaviour testable without making tests brittle. Wording changes constantly
-and harmlessly. Structure - which tools, in what order, with what arguments, at what
-cost - is what actually breaks production.
+## 1. The context seam
 
-## The context indirection
+Agents do not call models or tools directly. They call a context object:
 
-Everything rests on one indirection. The agent receives a context object and calls
-`ctx.model(...)` and `ctx.tool(...)` instead of touching providers directly.
-
-```
-  LIVE                                   REPLAY
-  ----                                   ------
-  agent(ctx)                             agent(ctx)
-     |                                      |
-  LiveContext                          ReplayContext
-     |-- model_fn  --> real provider       |-- model  --> recorded response
-     |-- tools     --> real side effects   |-- tool   --> recorded result
-     |                                      |
-  Recorder                               observed Trace
-     |
-  golden Trace
+```python
+def agent(ctx):
+    result = ctx.tool("lookup", id="A-1")
+    text = ctx.model("decide")
 ```
 
-The agent source is identical in both modes. Only the context differs.
+Two implementations satisfy that interface:
 
-## The trace format
+| | `LiveContext` | `ReplayContext` |
+| :--- | :--- | :--- |
+| model calls | real provider call | served from the trace |
+| tool calls | real function call | served from the trace |
+| side effects | yes | never |
+| cost | real | zero |
+| determinism | no | total |
 
-A trace is plain JSON so it diffs cleanly in pull requests:
+Because both expose the same two methods, agent code is byte-for-byte identical
+in recording and replay. There is no test-only branch to drift out of sync.
 
-```jsonc
-{
-  "schema_version": "1.0",
-  "name": "refund_flow",
-  "steps": [
-    { "kind": "model", "index": 0, "response_text": "...", "cost_usd": 0.0012 },
-    { "kind": "tool",  "index": 1, "name": "lookup_order", "arguments": { "order_id": "A-1042" } }
-  ],
-  "final_output": "Refund of $49.00 issued for order A-1042."
-}
+## 2. Traces are plain data
+
+A `Trace` is a Pydantic model that serialises to readable JSON: an ordered list
+of `ModelCall` and `ToolCall` steps, discriminated by a `kind` field.
+
+This matters more than it sounds. Because traces are plain JSON:
+
+- `git diff` shows exactly which decision changed
+- reviewers can audit behaviour change without running code
+- traces can be generated, inspected, and edited by other tools
+
+The schema carries a `schema_version`, and loading rejects versions this build
+does not understand rather than failing in a confusing way later.
+
+## 3. Replay by content, not position
+
+Tool results are keyed by `(tool_name, digest(arguments))`, where the digest is a
+truncated SHA-256 of the canonically serialised arguments - keys sorted, so
+argument order never matters.
+
+The consequence: **a cache miss is the finding.** If the agent asks for a tool
+call it never made during the good run, replay stops and tells you, rather than
+improvising a result and letting the difference go unnoticed.
+
+Model calls are served in order from a queue, since prompts legitimately change
+wording between runs while the sequence of decisions should not.
+
+## 4. Assertions target actions, not prose
+
+LLM output is stochastic. Asserting on text produces a flaky suite that people
+switch off within a month.
+
+The decision path is not stochastic in the same way. A well-built agent looks up
+an order, decides, refunds, then notifies - every time. That order is a
+specification, and it is what the assertions target.
+
+Output similarity exists as a soft check, defaults to a forgiving 0.85, and can
+be downgraded to a warning. It is the exception, not the model.
+
+## 5. One replay reports everything
+
+`Policy.evaluate()` runs every enabled check and returns all violations. You are
+never fixing one regression only to discover a second on the next run.
+
+Violations carry a `severity`, so a policy can distinguish "this must not ship"
+from "a human should look at this".
+
+## Module map
+
+```text
+src/agentgate/
+  trace.py           data model, digests, load and save
+  recorder.py        LiveContext, Recorder, record_run
+  replay.py          ReplayContext, replay_run
+  assertions.py      checks and Policy
+  reporting.py       text, markdown, JSON, GitHub annotations
+  config.py          [tool.agentgate] in pyproject.toml
+  redaction.py       strips secrets before traces hit disk
+  pricing.py         token cost table
+  resolve.py         module:attribute entrypoints
+  cli.py             init, record, list, show, verify
+  pytest_plugin.py   the agentgate fixture
+  mcp_server.py      list_traces, show_trace, verify_agent
+  adapters/          OpenAI and Anthropic model functions
 ```
 
-Steps are a discriminated union on `kind`. Ordering is the contract.
+## Redaction
 
-## Determinism
+Golden traces get committed, so `save_trace` redacts sensitive tool arguments and
+results on the way out. Redaction happens at write time, never at record time -
+the live run always receives real values.
 
-During replay:
+Model prompts are stored only as digests, so prompt content never reaches disk.
 
-- Model responses are dequeued from the golden trace in order
-- Tool results are looked up by `(name, digest(arguments))`
-- Latency is recorded as zero, because nothing actually executes
-- No network call is possible, so no cost is incurred and no side effect fires
+## Deliberate limits
 
-An unmatched lookup is not a fallback - it is the signal. If the agent asks for a
-tool call that was never recorded, its behaviour has changed, and `ReplayError` says so.
-
-## Assertion layer
-
-`Policy` bundles checks and returns a list of `Violation` objects rather than raising
-on the first failure, so a single run reports every regression at once. `render_report`
-turns violations into a step-by-step diff for terminals, CI logs, and PR comments.
-
-## Boundaries
-
-agentgate deliberately does **not**:
-
-- Judge answer quality - use an LLM judge for that, on top of this layer
-- Replace production observability - it gates *before* the merge, not after deploy
-- Own your model or tool clients - it wraps them through the context, nothing more
+- **Synchronous only.** Async agent support is planned, not present.
+- **No parallel tool calls.** Concurrent calls have no deterministic order to assert against.
+- **Replay assumes tool purity.** A tool whose result depends on wall-clock time will need `ignore_arguments`.
+- **Not an eval harness.** agentgate answers "did behaviour change?", not "is the answer good?". Use both.

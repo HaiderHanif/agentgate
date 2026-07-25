@@ -1,41 +1,40 @@
-<h1 align="center">agentgate</h1>
+<div align="center">
 
-<p align="center">
-  <b>Regression gating for AI agents.</b><br>
-  Record what a working agent did. Replay it deterministically. Fail CI when the behaviour changes.
-</p>
+# agentgate
 
-<p align="center">
-  <a href="https://github.com/HaiderHanif/agentgate/actions/workflows/ci.yml"><img src="https://github.com/HaiderHanif/agentgate/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-0B0B0B?style=flat-square" alt="Python">
-  <img src="https://img.shields.io/badge/license-MIT-0B0B0B?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/status-alpha-0B0B0B?style=flat-square" alt="Status">
-</p>
+**Stop shipping agent regressions.**
+
+Golden-trace testing, deterministic replay, and CI gates for LLM agents.
+Runs as a pytest plugin, a CLI, a GitHub Action, or an MCP server.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/HaiderHanif/agentgate/ci.yml?branch=main&style=flat-square&labelColor=0B0B0B&color=0B0B0B)](https://github.com/HaiderHanif/agentgate/actions)
+[![PyPI](https://img.shields.io/pypi/v/agentgate?style=flat-square&labelColor=0B0B0B&color=0B0B0B)](https://pypi.org/project/agentgate/)
+[![Python](https://img.shields.io/pypi/pyversions/agentgate?style=flat-square&labelColor=0B0B0B&color=0B0B0B)](https://pypi.org/project/agentgate/)
+[![License](https://img.shields.io/badge/license-MIT-0B0B0B?style=flat-square&labelColor=0B0B0B)](LICENSE)
+
+</div>
 
 ---
 
 ## The problem
 
-You ship an agent that handles refunds. It works. Two weeks later someone tweaks a prompt, or the model provider ships an update, and now the agent **emails the customer before the refund is actually issued**.
+You tweak a prompt. Tests pass. Evals score the same. Two days later you find out
+the agent started emailing customers *before* issuing their refunds.
 
-Nobody notices until a customer complains.
+Nothing was broken in a way any test could see. The output was fine. The cost was
+fine. The **order of actions** changed, and nothing was watching that.
 
-Normal code has a safety net for exactly this: you write a test, the test fails, you fix it. Agents don't, because they say something slightly different on every run. So most teams skip testing entirely and hope.
+Agent regressions hide in the decision path, not the text.
 
-## What agentgate does
+## The approach
 
-It makes agents testable by asserting on **what the agent did**, not **what it said**.
+1. **Record** one good run. Every model call, every tool call, arguments, cost, latency.
+2. **Replay** it deterministically. No network, no side effects, no spend, sub-second.
+3. **Compare** the decision path against the golden trace.
+4. **Block** the merge when behaviour changed and nobody meant it to.
 
-```
-  record  ->  a working run is captured as a golden trace (tools, order, args, cost)
-  replay  ->  the run is re-executed with the model and tools mocked from that trace
-  compare ->  wording may drift freely; the decision path may not
-  gate    ->  CI fails the pull request, pointing at the exact diverging step
-```
-
-Replay makes no network calls. A 50-trace suite runs in seconds and costs **$0**.
-
----
+It is a dashcam for your agent, plus a rehearsal room where you can re-run the
+exact same conditions forever.
 
 ## Install
 
@@ -43,166 +42,168 @@ Replay makes no network calls. A 50-trace suite runs in seconds and costs **$0**
 pip install agentgate
 ```
 
-## 60-second example
+## Quickstart
 
-Write the agent against a context object instead of calling the model and tools directly:
+Your agent takes a context object and uses it for model and tool calls. That one
+convention is what makes a run recordable and replayable.
 
 ```python
-def refund_agent(ctx) -> str:
-    ctx.model("Customer wants a refund for order A-1042. Plan the steps.")
+def handle_refund(ctx):
     order = ctx.tool("lookup_order", order_id="A-1042")
-    ctx.tool("issue_refund", order_id="A-1042", amount=order["amount"])
-    ctx.tool("send_email", to="customer@example.com", template="refund_confirmed")
-    return f"Refund of ${order['amount']:.2f} issued for order A-1042."
+    decision = ctx.model(f"Should we refund order {order['id']}?")
+
+    ctx.tool("issue_refund", order_id=order["id"], amount=order["amount"])
+    ctx.tool("send_email", to=order["email"])
+
+    return f"Refunded ${order['amount']}. {decision}"
 ```
 
-**Record once**, while it behaves correctly:
+Record a golden trace once:
 
-```python
-from agentgate import record_run
-
-trace = record_run("refund_flow", refund_agent, model_fn, tools, trace_dir="traces")
+```bash
+agentgate record app.agent:handle_refund \
+  --model app.agent:model_fn \
+  --tools app.agent:TOOLS \
+  --name refund_flow
 ```
 
-**Assert forever**, in your normal test suite:
+Gate on it forever:
 
 ```python
 def test_refund_flow(agentgate):
-    agentgate.assert_matches(refund_agent, "refund_flow")
+    agentgate.assert_matches(handle_refund, "refund_flow")
 ```
 
-When someone reorders the refund and the email, the test fails like this:
+When the agent regresses, you get the decision path, not a stack trace:
 
 ```text
 agentgate: refund_flow
 ======================
 
-FAIL - 1 behavioural regression(s)
+FAIL - 1 behavioural finding(s)
 
 Tool call path
 --------------
-   1. ok       lookup_order
-   2. changed  issue_refund -> send_email
-   3. changed  send_email -> issue_refund
+  ok        1. lookup_order
+  changed   2. issue_refund -> send_email
+  changed   3. send_email -> issue_refund
 
-Violations
-----------
-  [tool_sequence] tool call order diverged from the golden trace
+Findings
+--------
+  [error] [tool_sequence] tool call order diverged from the golden trace
       expected: ['lookup_order', 'issue_refund', 'send_email']
       actual:   ['lookup_order', 'send_email', 'issue_refund']
 ```
 
-No API key. No tokens spent. Sub-second.
+Commit the trace. Now every pull request is checked against known-good behaviour.
 
----
+## What it asserts
 
-## What you can assert
+Behaviour, not wording. Phrasing drifts constantly and harmlessly; these do not.
 
 | Check | Catches |
 | :--- | :--- |
-| `tool_sequence` | The agent reordered, skipped, or added a step |
-| `tool_arguments` | Same tools, wrong values passed |
-| `required_tools` | A mandatory step (audit log, verification) silently disappeared |
-| `forbidden_tools` | The agent reached for something it must never touch |
-| `max_cost_usd` | A prompt change quietly tripled token spend |
-| `max_latency_ms` | The run drifted past its time budget |
-| `output_similarity` | The final answer changed meaningfully, not just cosmetically |
+| `tool_sequence` | the agent reordered, skipped, or added actions |
+| `tool_arguments` | same tools, wrong values |
+| `required_tools` | a mandatory step silently disappeared |
+| `forbidden_tools` | the agent reached for something dangerous |
+| `no_tool_errors` | a tool started failing |
+| `cost_ceiling` | a prompt change quietly tripled spend |
+| `latency_budget` | the agent got slower |
+| `step_count` | a reasoning loop started running away |
+| `output_similarity` | the answer changed meaning, not just phrasing |
 
-Bundle them into a reusable `Policy`:
+Every check runs on every replay, so one run reports every regression at once.
 
 ```python
 from agentgate import Policy
 
-policy = Policy(
-    required_tools=["lookup_order", "issue_refund"],
+POLICY = Policy(
+    required_tools=["issue_refund"],
     forbidden_tools=["delete_customer"],
     max_cost_usd=0.05,
     output_similarity=0.85,
 )
-
-def test_refund_flow(agentgate):
-    agentgate.assert_matches(refund_agent, "refund_flow", policy)
 ```
 
----
-
-## Use it in CI
+## In CI
 
 ```yaml
-- uses: HaiderHanif/agentgate@v0
+- uses: HaiderHanif/agentgate@v1
   with:
-    agent: examples.refund_agent.agent:refund_agent
-    trace: examples/refund_agent/traces/refund_flow.json
+    agent: app.agent:handle_refund
+    trace: traces/refund_flow.json
     max-cost: "0.05"
 ```
 
-The job fails on divergence and prints the exact step that changed.
+Findings are emitted as GitHub annotations, so they appear inline in the pull
+request diff.
 
-## Command line
-
-```bash
-agentgate list                                  # every golden trace and its cost
-agentgate show traces/refund_flow.json          # the recorded decision path
-agentgate verify pkg.agent:refund_agent traces/refund_flow.json --max-cost 0.05
-```
-
-## Use it from your coding agent
-
-agentgate also runs as an MCP server, so Claude Code, Cursor, Codex, or Gemini CLI can inspect and run your evals directly:
+## For coding agents
 
 ```bash
 pip install "agentgate[mcp]"
 python -m agentgate.mcp_server
 ```
 
----
+Exposes `list_traces`, `show_trace`, and `verify_agent` over MCP, so Claude Code,
+Cursor, or Codex can check whether a change regressed your agent before it
+suggests shipping it.
 
-## How it works
+## Re-recording
 
-```
-           LIVE RUN                              REPLAY RUN
-  agent -> LiveContext -> real model      agent -> ReplayContext -> golden trace
-                       -> real tools                             -> golden trace
-              |                                        |
-              v                                        v
-        golden trace  ------------ compare ------->  observed trace
-                                      |
-                                 violations -> report -> exit code
+Behaviour changes are often intentional. Re-record, then review the diff:
+
+```bash
+pytest --agentgate-update
+git diff traces/
 ```
 
-The agent code is identical in both modes. The only thing that changes is the context it is handed. See [docs/architecture.md](docs/architecture.md).
+Traces are plain JSON. A reviewer can see exactly which decision changed without
+running anything. Behavioural change becomes a reviewable artifact instead of a
+surprise in production.
 
----
+## Safety
 
-## Why not just...
+Traces are committed to source control, so sensitive tool arguments and results
+are redacted on write. Configure the key list in `pyproject.toml`:
 
-**...write normal unit tests?** They break on every harmless rewording, so teams delete them.
+```toml
+[tool.agentgate]
+trace_dir = "traces"
+redact_keys = ["api_key", "customer_email", "card_number"]
 
-**...use an LLM-as-judge eval?** Useful, but slow, non-deterministic, and it costs money on every CI run. agentgate is the deterministic layer underneath: it catches structural regressions in milliseconds, leaving judges for genuine quality questions.
+[tool.agentgate.policy]
+max_cost_usd = 0.05
+```
 
-**...use a hosted observability platform?** Those tell you what broke *after* it reached production. agentgate blocks the pull request.
+Replay never makes a network call and never fires a side effect, by construction.
 
----
+## Docs
 
-## Roadmap
+- [Quickstart](docs/quickstart.md)
+- [CLI reference](docs/cli.md)
+- [Writing policies](docs/policies.md)
+- [Architecture](docs/architecture.md)
+- [Worked example](examples/refund_agent/)
 
-- [x] Golden trace format, recorder, deterministic replay
-- [x] Behavioural policy checks and CI-ready reports
-- [x] pytest plugin and GitHub Action
-- [x] MCP server mode
-- [ ] Native adapters: OpenAI SDK, Anthropic SDK, LangGraph
-- [ ] OpenTelemetry trace import
-- [ ] PR comment bot with inline step diffs
-- [ ] Flake detection across repeated live runs
+## Framework support
+
+agentgate is framework-agnostic: if your agent can call `ctx.model()` and
+`ctx.tool()`, it works. Adapters for OpenAI and Anthropic capture token counts
+and pricing automatically.
+
+- [x] Plain Python agents
+- [x] OpenAI
+- [x] Anthropic
+- [ ] LangGraph (planned)
+- [ ] CrewAI (planned)
+- [ ] Async agents (planned)
 
 ## Contributing
 
-Issues and pull requests are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md). Good first issues are labelled.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
----
-
-<p align="center"><sub>Built by <a href="https://github.com/HaiderHanif">Haider Hanif</a> - AI Automation Engineer</sub></p>
+MIT

@@ -1,88 +1,115 @@
 # Quickstart
 
+From zero to a working regression gate in about five minutes.
+
 ## 1. Install
 
 ```bash
 pip install agentgate
+agentgate init
 ```
 
-## 2. Write the agent against a context
+`init` creates a `traces/` directory and prints the configuration block to add to
+your `pyproject.toml`.
 
-The single design rule: the agent never calls the model or its tools directly.
-It goes through a context object, which is what makes runs capturable and replayable.
+## 2. Adapt your agent
+
+An agentgate agent is any callable that takes a context and returns a string.
+Instead of calling your model client and tools directly, go through the context:
 
 ```python
-def refund_agent(ctx) -> str:
-    ctx.model("Customer wants a refund for order A-1042. Plan the steps.")
+# before
+def handle_refund():
+    order = db.lookup_order("A-1042")
+    decision = openai_client.chat(...)
+    payments.refund(order["id"], order["amount"])
+
+# after
+def handle_refund(ctx):
     order = ctx.tool("lookup_order", order_id="A-1042")
-    ctx.tool("issue_refund", order_id="A-1042", amount=order["amount"])
-    ctx.tool("send_email", to="customer@example.com", template="refund_confirmed")
-    return f"Refund of ${order['amount']:.2f} issued for order A-1042."
+    decision = ctx.model(f"Should we refund {order['id']}?")
+    ctx.tool("issue_refund", order_id=order["id"], amount=order["amount"])
+    return decision
 ```
 
-## 3. Record a golden trace
+This is the only change agentgate asks for. The context is the seam that makes a
+run both recordable and replayable.
 
-Run it for real, once, while it behaves correctly.
+## 3. Declare your tools and model
 
 ```python
-from agentgate import record_run
+from openai import OpenAI
+from agentgate.adapters import openai_model_fn
 
-def model_fn(prompt: str) -> str:
-    ...  # your real model call
-
-tools = {
-    "lookup_order": lookup_order,
-    "issue_refund": issue_refund,
-    "send_email": send_email,
+TOOLS = {
+    "lookup_order": db.lookup_order,
+    "issue_refund": payments.refund,
 }
 
-record_run("refund_flow", refund_agent, model_fn, tools, trace_dir="traces")
+model_fn = openai_model_fn(OpenAI(), model="gpt-4o-mini")
 ```
 
-Commit `traces/refund_flow.json`. Review it like source code - it *is* your specification.
+A model function is just `Callable[[str], str | ModelResult]`. Returning a
+`ModelResult` adds token counts, which is what makes cost assertions work.
 
-## 4. Assert in your test suite
+## 4. Record a golden trace
+
+```bash
+agentgate record app.agent:handle_refund \
+  --model app.agent:model_fn \
+  --tools app.agent:TOOLS \
+  --name refund_flow
+```
+
+This is the one step that costs money and causes real side effects. **Point it at
+a sandbox.** Everything after this is free.
+
+Commit `traces/refund_flow.json`.
+
+## 5. Gate on it
 
 ```python
-from agentgate import Policy
-
-policy = Policy(
-    required_tools=["lookup_order", "issue_refund"],
-    forbidden_tools=["delete_customer"],
-    max_cost_usd=0.05,
-)
+# tests/test_agent.py
+from app.agent import handle_refund
 
 def test_refund_flow(agentgate):
-    agentgate.assert_matches(refund_agent, "refund_flow", policy)
+    agentgate.assert_matches(handle_refund, "refund_flow")
 ```
 
 ```bash
 pytest
 ```
 
-## 5. Re-record after an intended change
+Replay is deterministic and offline, so this runs in milliseconds and costs
+nothing. Run it on every commit.
 
-When you deliberately change behaviour, update the golden trace and commit the diff
-so reviewers can see exactly what changed:
+## 6. Handle intentional changes
+
+When you deliberately change behaviour, the gate will fail. That is correct.
+Re-record and review the diff:
 
 ```bash
 pytest --agentgate-update
+git diff traces/
 ```
 
-## 6. Gate pull requests
+Re-recording needs live access, so pass a `LiveSpec`:
 
-```yaml
-- uses: HaiderHanif/agentgate@v0
-  with:
-    agent: myapp.agents:refund_agent
-    trace: traces/refund_flow.json
-    max-cost: "0.05"
+```python
+from agentgate.pytest_plugin import LiveSpec
+from app.agent import TOOLS, handle_refund, model_fn
+
+LIVE = LiveSpec(model_fn=model_fn, tools=TOOLS)
+
+def test_refund_flow(agentgate):
+    agentgate.assert_matches(handle_refund, "refund_flow", live=LIVE)
 ```
 
-## Strict vs lenient replay
+Without a `LiveSpec`, `--agentgate-update` skips rather than silently recording
+nothing.
 
-By default replay is **strict**: a tool call must match a recorded call by name *and*
-arguments, otherwise `ReplayError` is raised. This is what catches silent argument drift.
+## Next
 
-Pass `strict=False` to fall back to matching by tool name alone, which is useful while
-an agent is still under heavy development.
+- [Writing policies](policies.md) - tune what counts as a regression
+- [CLI reference](cli.md) - every command and flag
+- [Architecture](architecture.md) - how replay stays deterministic

@@ -17,7 +17,6 @@ POLICY = Policy(
 
 def test_refund_flow_is_unchanged(agentgate):
     """Passes: the agent takes exactly the decision path that was recorded."""
-    agentgate.trace_dir = agentgate.trace_dir  # honours --agentgate-dir
     agentgate.assert_matches(handle_refund, "refund_flow", POLICY, live=LIVE)
 
 
