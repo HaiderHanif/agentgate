@@ -1,44 +1,76 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
+from agentgate.exceptions import ReplayError
 from agentgate.recorder import record_run
-from agentgate.replay import ReplayError, replay_run
+from agentgate.replay import replay_run
 
 
-def model_fn(prompt: str) -> str:
-    return "refund it"
+def test_replay_reproduces_the_run(agent, model_fn, tools) -> None:
+    golden = record_run("refund", agent, model_fn, tools)
+    observed = replay_run(golden, agent)
 
-
-TOOLS = {
-    "lookup_order": lambda order_id: {"id": order_id, "amount": 40},
-    "issue_refund": lambda order_id, amount: {"refunded": amount},
-    "send_email": lambda to: {"sent": to},
-}
-
-
-def good_agent(ctx) -> str:
-    ctx.model("what should I do?")
-    order = ctx.tool("lookup_order", order_id="A-1")
-    ctx.tool("issue_refund", order_id="A-1", amount=order["amount"])
-    ctx.tool("send_email", to="customer@example.com")
-    return "Refund issued and customer notified."
-
-
-def test_replay_is_deterministic_and_free() -> None:
-    golden = record_run("refund_flow", good_agent, model_fn, TOOLS)
-    observed = replay_run(golden, good_agent)
     assert observed.tool_sequence == golden.tool_sequence
-    assert observed.total_latency_ms == 0.0
+    assert observed.final_output == golden.final_output
 
 
-def test_unknown_tool_arguments_raise() -> None:
-    golden = record_run("refund_flow", good_agent, model_fn, TOOLS)
+def test_replay_is_free_and_deterministic(agent, model_fn, tools) -> None:
+    calls = {"n": 0}
 
-    def drifted_agent(ctx) -> str:
-        ctx.model("what should I do?")
+    def counting_model(prompt: str) -> str:
+        calls["n"] += 1
+        return "never reached"
+
+    golden = record_run("refund", agent, model_fn, tools)
+    first = replay_run(golden, agent)
+    second = replay_run(golden, agent)
+
+    assert calls["n"] == 0
+    assert first.tool_sequence == second.tool_sequence
+    assert first.total_latency_ms == 0.0
+
+
+def test_unknown_tool_arguments_are_a_finding(agent, model_fn, tools) -> None:
+    golden = record_run("refund", agent, model_fn, tools)
+
+    def changed_agent(ctx: Any) -> str:
         ctx.tool("lookup_order", order_id="DIFFERENT")
-        return "done"
+        return ""
 
-    with pytest.raises(ReplayError):
-        replay_run(golden, drifted_agent)
+    with pytest.raises(ReplayError, match="no recorded result"):
+        replay_run(golden, changed_agent)
+
+
+def test_non_strict_mode_matches_by_tool_name(agent, model_fn, tools) -> None:
+    golden = record_run("refund", agent, model_fn, tools)
+
+    def changed_agent(ctx: Any) -> str:
+        order = ctx.tool("lookup_order", order_id="DIFFERENT")
+        return str(order["amount"])
+
+    observed = replay_run(golden, changed_agent, strict=False)
+    assert observed.tool_sequence == ["lookup_order"]
+
+
+def test_extra_model_calls_are_a_finding(agent, model_fn, tools) -> None:
+    golden = record_run("refund", agent, model_fn, tools)
+
+    def chatty_agent(ctx: Any) -> str:
+        ctx.model("one")
+        ctx.model("two")
+        return ""
+
+    with pytest.raises(ReplayError, match="more model calls"):
+        replay_run(golden, chatty_agent)
+
+
+def test_reordering_replays_but_diverges(agent, regressed_agent, model_fn, tools) -> None:
+    """The regression is legal to replay - which is exactly why it needs asserting."""
+    golden = record_run("refund", agent, model_fn, tools)
+    observed = replay_run(golden, regressed_agent)
+
+    assert observed.tool_sequence == ["lookup_order", "send_email", "issue_refund"]
+    assert observed.tool_sequence != golden.tool_sequence
