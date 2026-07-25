@@ -4,11 +4,17 @@ During replay no network call is made and no side effect fires. Model responses
 and tool results are served from the golden trace, so the run is fast, free, and
 identical every time. What we observe is the agent's *decision path* under
 exactly the conditions that were recorded.
+
+One consequence is worth stating plainly: replay can only serve results that were
+recorded. An agent that starts calling a tool the golden run never called has no
+recorded answer to receive, and that is reported rather than guessed. When the
+new step is intentional, supply a stub for it with `extra_tools` - which lets you
+verify a refactor without re-recording - or re-record the trace.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from agentgate.exceptions import ReplayError
@@ -24,7 +30,13 @@ class ReplayContext:
     byte-for-byte identical in both modes.
     """
 
-    def __init__(self, golden: Trace, *, strict: bool = True) -> None:
+    def __init__(
+        self,
+        golden: Trace,
+        *,
+        strict: bool = True,
+        extra_tools: Mapping[str, Any] | None = None,
+    ) -> None:
         self._golden = golden
         self._strict = strict
         self._model_queue: list[ModelCall] = list(golden.model_calls)
@@ -32,6 +44,7 @@ class ReplayContext:
             (t.name, digest(t.arguments)): t.result for t in golden.tool_calls
         }
         self._by_name: dict[str, Any] = {t.name: t.result for t in golden.tool_calls}
+        self._extra: dict[str, Any] = dict(extra_tools or {})
         self.observed = Trace(
             name=golden.name,
             agent=golden.agent,
@@ -66,21 +79,28 @@ class ReplayContext:
         return recorded.response_text
 
     def tool(self, name: str, **arguments: Any) -> Any:
-        """Serve the recorded result for this exact tool call.
+        """Serve the recorded result for this tool call.
 
-        A miss is not an error condition to work around - it *is* the finding.
+        Resolution order: the exact recorded call, then an explicit `extra_tools`
+        stub, then - in non-strict mode - any recorded call to the same tool.
+
+        A miss is not an error condition to work around, it *is* the finding.
         The agent asked for something it never asked for when the trace was good.
         """
         key = (name, digest(arguments))
         if key in self._exact:
             result = self._exact[key]
+        elif name in self._extra:
+            result = self._extra[name]
         elif not self._strict and name in self._by_name:
             result = self._by_name[name]
         else:
             raise ReplayError(
                 f"no recorded result for tool {name!r} with arguments {arguments!r}. "
                 f"Recorded path was {self._golden.tool_sequence}. "
-                f"Either the agent's behaviour changed, or the trace needs re-recording."
+                f"Either the agent's behaviour changed, or the trace needs "
+                f"re-recording. To verify an intentional new step without "
+                f"re-recording, pass extra_tools={{{name!r}: <result>}}."
             )
         self.observed.steps.append(
             ToolCall(index=self._next_index, name=name, arguments=arguments, result=result)
@@ -97,8 +117,14 @@ def replay_run(
     agent: Callable[[ReplayContext], str],
     *,
     strict: bool = True,
+    extra_tools: Mapping[str, Any] | None = None,
 ) -> Trace:
-    """Replay `agent` against `golden` and return the observed trace."""
-    context = ReplayContext(golden, strict=strict)
+    """Replay `agent` against `golden` and return the observed trace.
+
+    :param strict: match recorded tool calls on arguments as well as name.
+    :param extra_tools: stub results for tools absent from the golden trace,
+        so an intentionally added step can be verified without re-recording.
+    """
+    context = ReplayContext(golden, strict=strict, extra_tools=extra_tools)
     output = agent(context)
     return context.finish(output)

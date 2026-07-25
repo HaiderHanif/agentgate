@@ -9,6 +9,11 @@
     agentgate verify app:agent trace     replay and gate on behaviour
 
 Exit codes are stable and CI-friendly: 0 clean, 1 violations, 2 usage error.
+
+Everything this module prints that originated in a trace is escaped before it
+reaches Rich. Trace content is attacker-influenced - it is exactly where an
+injection payload lives - and a console renderer that interprets it as markup
+would crash on the payloads this tool exists to find.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.syntax import Syntax
 from rich.table import Table
 
@@ -66,8 +72,13 @@ output_similarity = 0.85
 """.lstrip()
 
 
+def _safe(value: object) -> str:
+    """Render untrusted text without letting it act as console markup."""
+    return escape(str(value))
+
+
 def _fail(message: str, code: int = EXIT_USAGE) -> None:
-    err_console.print(f"[bold red]error[/bold red] {message}")
+    err_console.print(f"[bold red]error[/bold red] {_safe(message)}")
     raise typer.Exit(code)
 
 
@@ -87,7 +98,7 @@ def init_project(
     if not any(trace_dir.iterdir()):
         gitkeep.touch()
 
-    console.print(f"[green]created[/green] {trace_dir}/")
+    console.print(f"[green]created[/green] {_safe(trace_dir)}/")
     console.print(f"\nAdd this to your {PYPROJECT}:\n")
     console.print(Syntax(CONFIG_SNIPPET, "toml", theme="ansi_dark"))
 
@@ -105,7 +116,7 @@ def list_traces(
 
     paths = sorted(target.glob("*.json"))
     if not paths:
-        console.print(f"[yellow]no traces found in {target}[/yellow]")
+        console.print(f"[yellow]no traces found in {_safe(target)}[/yellow]")
         raise typer.Exit(EXIT_OK)
 
     table = Table(title=f"golden traces in {target}", header_style="bold")
@@ -116,12 +127,14 @@ def list_traces(
         try:
             trace = load_trace(path)
         except AgentGateError as exc:
-            table.add_row(path.stem, f"[red]unreadable[/red] {exc}", "-", "-", "-", "-", "-")
+            table.add_row(
+                _safe(path.stem), f"[red]unreadable[/red] {_safe(exc)}", "-", "-", "-", "-", "-"
+            )
             continue
         table.add_row(
-            trace.name,
-            trace.agent,
-            " -> ".join(trace.tool_sequence) or "-",
+            _safe(trace.name),
+            _safe(trace.agent),
+            _safe(" -> ".join(trace.tool_sequence)) or "-",
             str(len(trace.steps)),
             f"${trace.total_cost_usd:.4f}",
             "yes" if is_signed(trace) else "[yellow]no[/yellow]",
@@ -141,7 +154,10 @@ def show(
         _fail(str(exc))
         return
 
-    console.print(f"[bold]{trace.name}[/bold]  agent={trace.agent}  schema={trace.schema_version}")
+    console.print(
+        f"[bold]{_safe(trace.name)}[/bold]  agent={_safe(trace.agent)}  "
+        f"schema={_safe(trace.schema_version)}"
+    )
     console.print(
         f"steps={len(trace.steps)}  tokens={trace.total_tokens}  "
         f"cost=${trace.total_cost_usd:.4f}  latency={trace.total_latency_ms:.1f}ms\n"
@@ -150,16 +166,18 @@ def show(
     for step in trace.steps:
         if step.kind == "model":
             preview = step.response_text[:80].replace("\n", " ")
-            console.print(f"  {step.index:>2}. [cyan]model[/cyan]  {step.model}  {preview!r}")
-        else:
-            status = f"[red]{step.error}[/red]" if step.error else ""
             console.print(
-                f"  {step.index:>2}. [magenta]tool[/magenta]   {step.name}"
-                f"({step.arguments}) {status}"
+                f"  {step.index:>2}. [cyan]model[/cyan]  {_safe(step.model)}  {_safe(preview)!r}"
+            )
+        else:
+            status = f"[red]{_safe(step.error)}[/red]" if step.error else ""
+            console.print(
+                f"  {step.index:>2}. [magenta]tool[/magenta]   {_safe(step.name)}"
+                f"({_safe(step.arguments)}) {status}"
             )
 
     if trace.final_output:
-        console.print(f"\n[bold]final output[/bold]\n{trace.final_output}")
+        console.print(f"\n[bold]final output[/bold]\n{_safe(trace.final_output)}")
 
 
 @app.command()
@@ -195,9 +213,10 @@ def record(
         redact=config.redact_keys,
     )
     path = target_dir / f"{name}.json"
-    console.print(f"[green]recorded[/green] {path}")
+    console.print(f"[green]recorded[/green] {_safe(path)}")
     console.print(
-        f"  {len(trace.tool_calls)} tool calls: {' -> '.join(trace.tool_sequence) or '-'}"
+        f"  {len(trace.tool_calls)} tool calls: "
+        f"{_safe(' -> '.join(trace.tool_sequence)) or '-'}"
     )
     console.print(f"  cost ${trace.total_cost_usd:.4f}  tokens {trace.total_tokens}")
 
@@ -230,7 +249,7 @@ def sign(
         return
 
     path.write_text(signed.to_json(), encoding="utf-8")
-    console.print(f"[green]signed[/green] {path}")
+    console.print(f"[green]signed[/green] {_safe(path)}")
     console.print(f"  fingerprint {fingerprint(signed)[:16]}")
 
 
@@ -246,8 +265,8 @@ def scan(
 ) -> None:
     """Audit golden traces for injection payloads and, optionally, signatures.
 
-    Detection is heuristic: it reports what a human should look at, and cannot
-    decide intent. Findings are printed, not silently swallowed.
+    Detection is heuristic. It reports what a human should look at; it cannot
+    decide intent.
     """
     problems = 0
 
@@ -255,7 +274,7 @@ def scan(
         try:
             trace = load_trace(path)
         except AgentGateError as exc:
-            err_console.print(f"[red]unreadable[/red] {path}: {exc}")
+            err_console.print(f"[red]unreadable[/red] {_safe(path)}: {_safe(exc)}")
             problems += 1
             continue
 
@@ -263,19 +282,19 @@ def scan(
             try:
                 verify_trace(trace, key)
             except IntegrityError as exc:
-                err_console.print(f"[red]integrity[/red] {path}: {exc}")
+                err_console.print(f"[red]integrity[/red] {_safe(path)}: {_safe(exc)}")
                 problems += 1
 
         findings = scan_trace(trace)
         for finding in findings:
             err_console.print(
-                f"[yellow]injection[/yellow] {path}: {finding.pattern} "
-                f"at {finding.location}\n    {finding.excerpt!r}"
+                f"[yellow]injection[/yellow] {_safe(path)}: {_safe(finding.pattern)} "
+                f"at {_safe(finding.location)}\n    {_safe(finding.excerpt)}"
             )
         problems += len(findings)
 
         if not findings:
-            console.print(f"[green]clean[/green] {path}")
+            console.print(f"[green]clean[/green] {_safe(path)}")
 
     raise typer.Exit(EXIT_VIOLATIONS if problems else EXIT_OK)
 
@@ -322,7 +341,7 @@ def verify(
         try:
             verify_trace(golden, key)
         except IntegrityError as exc:
-            err_console.print(f"[bold red]integrity[/bold red] {exc}")
+            err_console.print(f"[bold red]integrity[/bold red] {_safe(exc)}")
             if github:
                 print(f"::error file={trace_path}::[integrity] {exc}")
             raise typer.Exit(EXIT_VIOLATIONS) from exc
@@ -338,7 +357,7 @@ def verify(
     try:
         observed = replay_run(golden, agent_fn, strict=strict)
     except AgentGateError as exc:
-        err_console.print(f"[bold red]replay diverged[/bold red]\n{exc}")
+        err_console.print(f"[bold red]replay diverged[/bold red]\n{_safe(exc)}")
         if github:
             print(f"::error::[replay] {exc}")
         raise typer.Exit(EXIT_VIOLATIONS) from exc

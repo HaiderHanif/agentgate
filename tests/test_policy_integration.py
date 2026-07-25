@@ -12,7 +12,7 @@ import pytest
 
 from agentgate import ArgumentConstraint, Ordering, OutputPolicy, Policy
 from agentgate.recorder import record_run
-from agentgate.replay import replay_run
+from agentgate.replay import ReplayError, replay_run
 from agentgate.trace import ModelResult
 
 ORDER = {"id": "A-1042", "amount": 49.99, "email": "customer@example.com"}
@@ -24,7 +24,6 @@ def tools() -> dict[str, Any]:
         "lookup_order": lambda order_id: {**ORDER, "id": order_id},
         "issue_refund": lambda order_id, amount: {"refund_id": "RF-1", "amount": amount},
         "send_email": lambda to: {"delivered": True},
-        "audit_log": lambda event: {"logged": True},
     }
 
 
@@ -56,6 +55,10 @@ def test_ordering_constraint_survives_a_valid_refactor(golden) -> None:
 
     An added audit step is an improvement. Whole-sequence matching rejects it;
     an ordering constraint accepts it while still protecting the invariant.
+
+    The new tool has no recorded result, so replay is given a stub for it. That
+    is the honest shape of this workflow: verifying an added step means saying
+    what the added step returns.
     """
 
     def improved(ctx: Any) -> str:
@@ -66,7 +69,9 @@ def test_ordering_constraint_survives_a_valid_refactor(golden) -> None:
         ctx.tool("send_email", to=order["email"])
         return f"Refunded ${order['amount']}. {decision}"
 
-    observed = replay_run(golden, improved, strict=False)
+    observed = replay_run(
+        golden, improved, strict=False, extra_tools={"audit_log": {"logged": True}}
+    )
 
     strict = Policy()
     lenient = Policy(
@@ -78,6 +83,22 @@ def test_ordering_constraint_survives_a_valid_refactor(golden) -> None:
 
     assert strict.evaluate(golden, observed)  # rejects the improvement
     assert lenient.evaluate(golden, observed) == []  # accepts it
+
+
+def test_an_unrecorded_tool_is_reported_not_guessed(golden) -> None:
+    """Replay must never invent a result it was not given.
+
+    A silent stub here would be the worst possible behaviour: the agent would
+    appear to succeed against data that never existed.
+    """
+
+    def calls_something_new(ctx: Any) -> str:
+        ctx.tool("lookup_order", order_id="A-1042")
+        ctx.tool("audit_log", event="refund_approved")
+        return "done"
+
+    with pytest.raises(ReplayError, match="audit_log"):
+        replay_run(golden, calls_something_new, strict=False)
 
 
 def test_ordering_constraint_still_catches_the_real_bug(golden) -> None:
@@ -171,7 +192,7 @@ def test_injection_in_replayed_tool_output_is_surfaced(model_fn) -> None:
     violations = policy.evaluate(trace, trace)
 
     assert [v.code for v in violations] == ["prompt_injection"]
-    assert not policy.passes(trace, trace) is False  # warnings do not fail the run
+    assert policy.passes(trace, trace)  # a warning reports without failing the build
 
 
 def test_a_single_replay_reports_every_finding(golden) -> None:
