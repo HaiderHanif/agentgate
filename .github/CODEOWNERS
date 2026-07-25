@@ -1,0 +1,12 @@
+# Golden traces define what "correct behaviour" means. Editing one silently
+# redefines the specification, which makes them a security-relevant artifact
+# rather than test data. Every change needs an explicit review.
+
+/examples/**/traces/    @HaiderHanif
+/traces/                @HaiderHanif
+
+# The gate itself, and anything that could weaken it.
+/.github/workflows/     @HaiderHanif
+/action.yml             @HaiderHanif
+/src/agentgate/integrity.py   @HaiderHanif
+/src/agentgate/redaction.py   @HaiderHanif
