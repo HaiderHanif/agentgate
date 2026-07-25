@@ -11,12 +11,23 @@ Use these instead of, or alongside, whole-sequence comparison.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agentgate.trace import Trace
 from agentgate.violations import Severity, Violation
+
+
+def _compile_or_raise(pattern: str, label: str) -> str:
+    """Validate a regex at configuration time rather than mid-run."""
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"{label} {pattern!r} is not a valid regular expression: {exc}") from exc
+    return pattern
+
 
 # --------------------------------------------------------------------------- #
 # Ordering
@@ -29,6 +40,11 @@ class Ordering(BaseModel):
     This is the constraint that actually matters in the refund example. It holds
     regardless of what else the agent does around it, so refactors that add,
     remove, or reorder unrelated steps do not fail the build.
+
+    Scope, stated precisely: this compares *first occurrences*. It catches
+    "refunded before looking up the order". It does not catch a second,
+    unverified refund later in the same run - express that with
+    :class:`ArgumentConstraint` or a forbidden-tool rule.
     """
 
     first: str
@@ -120,6 +136,11 @@ class ArgumentConstraint(BaseModel):
     max_length: int | None = None
     severity: Severity = "error"
 
+    @field_validator("matches")
+    @classmethod
+    def _pattern_must_compile(cls, value: str | None) -> str | None:
+        return None if value is None else _compile_or_raise(value, "argument pattern")
+
     def _violation(self, message: str, expected: Any, actual: Any) -> Violation:
         return Violation(
             code="argument_constraint",
@@ -135,7 +156,9 @@ class ArgumentConstraint(BaseModel):
         if self.equals is not None and value != self.equals:
             found.append(self._violation("expected an exact value", self.equals, value))
         if self.not_equals is not None and value == self.not_equals:
-            found.append(self._violation("value is explicitly disallowed", f"not {self.not_equals}", value))
+            found.append(
+                self._violation("value is explicitly disallowed", f"not {self.not_equals}", value)
+            )
         if self.one_of is not None and value not in self.one_of:
             found.append(self._violation("value outside the allowed set", self.one_of, value))
         if self.matches is not None and not re.search(self.matches, str(value)):
@@ -143,7 +166,7 @@ class ArgumentConstraint(BaseModel):
         if self.max_length is not None and len(str(value)) > self.max_length:
             found.append(self._violation("value is too long", self.max_length, len(str(value))))
 
-        numeric_checks = (
+        numeric_checks: tuple[tuple[float | None, Callable[[float, float], bool], str], ...] = (
             (self.less_than, lambda v, b: v < b, "must be less than"),
             (self.less_or_equal, lambda v, b: v <= b, "must be at most"),
             (self.greater_than, lambda v, b: v > b, "must be greater than"),
@@ -152,7 +175,7 @@ class ArgumentConstraint(BaseModel):
         for bound, predicate, label in numeric_checks:
             if bound is None:
                 continue
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
                 found.append(self._violation("expected a number", f"{label} {bound}", value))
             elif not predicate(float(value), bound):
                 found.append(self._violation(f"{label} {bound}", bound, value))
@@ -215,6 +238,30 @@ class OutputPolicy(BaseModel):
     applies_to: Literal["final", "all"] = "final"
     severity: Severity = "error"
 
+    @field_validator("forbid_pii")
+    @classmethod
+    def _kinds_must_exist(cls, value: list[str]) -> list[str]:
+        """Reject unknown PII kinds instead of scanning for nothing.
+
+        `forbid_pii=["credit-card"]` used to be accepted and silently match
+        nothing, so the policy reported a clean run while checking for a kind
+        that does not exist. A privacy check that cannot fire is indistinguishable
+        from a privacy check that passed, which is the worse of the two.
+        """
+        unknown = [kind for kind in value if kind not in PII_PATTERNS]
+        if unknown:
+            raise ValueError(
+                f"unknown PII kind(s) {unknown}; choose from {sorted(PII_PATTERNS)}"
+            )
+        return value
+
+    @field_validator("must_match", "must_not_match")
+    @classmethod
+    def _patterns_must_compile(cls, value: list[str]) -> list[str]:
+        for pattern in value:
+            _compile_or_raise(pattern, "output pattern")
+        return value
+
     def _targets(self, observed: Trace) -> list[tuple[str, str]]:
         if self.applies_to == "final":
             return [("final_output", observed.final_output)]
@@ -242,20 +289,26 @@ class OutputPolicy(BaseModel):
                 needle = phrase if self.case_sensitive else phrase.lower()
                 if needle not in haystack:
                     violations.append(
-                        self._violation(f"required phrase {phrase!r} is missing", location, phrase, None)
+                        self._violation(
+                            f"required phrase {phrase!r} is missing", location, phrase, None
+                        )
                     )
 
             for phrase in self.must_not_contain:
                 needle = phrase if self.case_sensitive else phrase.lower()
                 if needle in haystack:
                     violations.append(
-                        self._violation(f"forbidden phrase {phrase!r} is present", location, None, phrase)
+                        self._violation(
+                            f"forbidden phrase {phrase!r} is present", location, None, phrase
+                        )
                     )
 
             for pattern in self.must_match:
                 if not re.search(pattern, text, flags):
                     violations.append(
-                        self._violation(f"required pattern {pattern!r} did not match", location, pattern, None)
+                        self._violation(
+                            f"required pattern {pattern!r} did not match", location, pattern, None
+                        )
                     )
 
             for pattern in self.must_not_match:
@@ -268,10 +321,7 @@ class OutputPolicy(BaseModel):
                     )
 
             for kind in self.forbid_pii:
-                pattern = PII_PATTERNS.get(kind)
-                if pattern is None:
-                    continue
-                match = pattern.search(text)
+                match = PII_PATTERNS[kind].search(text)
                 if match:
                     violations.append(
                         self._violation(
@@ -281,7 +331,9 @@ class OutputPolicy(BaseModel):
 
             if self.max_length is not None and len(text) > self.max_length:
                 violations.append(
-                    self._violation("output is longer than allowed", location, self.max_length, len(text))
+                    self._violation(
+                        "output is longer than allowed", location, self.max_length, len(text)
+                    )
                 )
 
         return violations
